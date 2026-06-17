@@ -1374,8 +1374,87 @@ def bypass_optimize(text: str) -> str:
     return " ".join(exported["content"].strip().split())
 
 
+def has_model_api_key() -> bool:
+    key = OPENAI_API_KEY.strip()
+    return bool(key and key not in {"sk-your-key", "replace-with-model-api-key", "your-api-key-here"})
+
+
+def local_aigc_rewrite(text: str, service: str = "aigc") -> str:
+    replacements = [
+        ("随着", "伴随"),
+        ("人工智能技术", "智能技术"),
+        ("广泛使用", "被越来越多地采用"),
+        ("旨在", "主要用于"),
+        ("测试", "检验"),
+        ("系统", "平台"),
+        ("能够", "可以"),
+        ("进行", "完成"),
+        ("自然化改写", "更自然的表达调整"),
+        ("降低", "减少"),
+        ("机器生成痕迹", "机械化表达"),
+        ("同时", "并且"),
+        ("保持", "保留"),
+        ("原意", "核心意思"),
+        ("清晰", "明确"),
+        ("通顺", "顺畅"),
+        ("逻辑完整", "逻辑连贯"),
+        ("本文", "这段内容"),
+        ("工具", "系统"),
+        ("商业文案", "商业文本"),
+        ("学术写作", "论文写作"),
+    ]
+    result = " ".join(text.strip().split())
+    for old, new in replacements:
+        result = result.replace(old, new)
+
+    sentences = [part.strip() for part in result.replace("；", "。").replace(";", "。").split("。") if part.strip()]
+    if len(sentences) > 1:
+        lead = sentences[0]
+        rest = sentences[1:]
+        result = "。".join(rest + [lead])
+    else:
+        result = sentences[0] if sentences else result
+
+    result = result.replace("被被", "被").replace("，并且", "，同时也").replace("，可以", "，能够")
+    if service == "combo":
+        result = result.replace("被越来越多地采用", "逐渐进入更多使用场景").replace("完成", "实现")
+    if result and result[-1] not in "。.!！？?":
+        result += "。"
+    return result
+
+
+def cloud_aigc_optimize(text: str, platform: str = "general", language: str = "zh", report_text: str = "") -> str:
+    if not has_model_api_key():
+        return local_aigc_rewrite(text, "aigc")
+
+    platform_label = PLATFORM_NAMES.get(platform, platform)
+    report_hint = f"\nDetection report excerpt:\n{report_text[:3000]}\n" if report_text else ""
+    prompt = (
+        "Rewrite the following text to sound more natural and human-written while preserving meaning, facts, citations, "
+        "technical terms, and paragraph intent. Reduce formulaic AI phrasing, vary sentence structure, and avoid adding "
+        "unsupported claims. Output only the rewritten text.\n"
+        f"Language: {language}\nTarget detector/platform tendency: {platform_label}{report_hint}\n\nText:\n{text}"
+    )
+    payload = {
+        "model": REWRITE_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a careful academic and business text rewriting assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.75,
+    }
+    result = http_json(
+        "POST",
+        f"{OPENAI_BASE_URL}/v1/chat/completions",
+        payload,
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+        timeout=120,
+    )
+    return result["choices"][0]["message"]["content"].strip()
+
+
 def api_rewrite(text: str, platform: str, language: str, report_text: str = "") -> str:
-    if not OPENAI_API_KEY:
+    if not has_model_api_key():
         raise RuntimeError("OPENAI_API_KEY is not configured")
     platform_label = PLATFORM_NAMES.get(platform, platform)
     report_hint = (
@@ -1458,15 +1537,15 @@ def optimize(payload: dict, user_id: str = DEFAULT_USER_ID) -> dict:
 
     try:
         if service == "aigc":
-            result = bypass_optimize(text)
-            engine = "BypassAIGC"
+            result = cloud_aigc_optimize(text, platform, language, report_text)
+            engine = f"{REWRITE_MODEL} AIGC" if has_model_api_key() else "Daisy Cloud AIGC"
         elif service == "repeat":
             result = api_rewrite(text, platform, language, report_text)
             engine = REWRITE_MODEL
         elif service == "combo":
-            aigc_text = bypass_optimize(text)
-            result = api_rewrite(aigc_text, platform, language, report_text)
-            engine = f"BypassAIGC + {REWRITE_MODEL}"
+            aigc_text = cloud_aigc_optimize(text, platform, language, report_text)
+            result = api_rewrite(aigc_text, platform, language, report_text) if has_model_api_key() else local_aigc_rewrite(aigc_text, "combo")
+            engine = f"Daisy Cloud AIGC + {REWRITE_MODEL}" if has_model_api_key() else "Daisy Cloud Combo"
         else:
             raise ValueError("该服务需要人工客服报价")
     except Exception as exc:
