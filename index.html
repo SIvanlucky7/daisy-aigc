@@ -326,14 +326,19 @@
           </span>
           <div>
             <h2 id="paymentTitle">账户充值</h2>
-            <p>选择金额创建支付单，扫码付款后提交交易号；核对到账后余额会自动入账。</p>
+            <p>三步完成充值：选金额、创建支付单、扫码后提交凭证。管理员核账后余额入账。</p>
           </div>
         </div>
+        <ol class="payment-steps" aria-label="充值步骤">
+          <li id="paymentStepAmount" class="active"><span>1</span><strong>选金额</strong></li>
+          <li id="paymentStepPay"><span>2</span><strong>扫码付款</strong></li>
+          <li id="paymentStepReview"><span>3</span><strong>等待核账</strong></li>
+        </ol>
         <div class="payment-layout">
           <section class="payment-section payment-amount-section">
             <div class="payment-section-head">
               <strong>选择金额</strong>
-              <small>充值后用于降重、降 AI 和订单处理</small>
+              <small>余额可用于降重、降 AI、组合处理和 API 调用</small>
             </div>
             <div class="payment-packages">
               <button data-pay-amount="10">¥10</button>
@@ -345,27 +350,46 @@
             <button class="auth-submit" id="createPaymentBtn">创建支付单</button>
             <button class="auth-submit secondary-action" id="confirmPaymentBtn" disabled>演示环境：确认到账</button>
           </section>
-          <section class="payment-card">
-            <span>当前支付单</span>
-            <strong id="paymentOrder">未创建</strong>
-            <small id="paymentHint">选择金额后点击创建支付单，再按页面提示扫码付款</small>
+          <section class="payment-card" aria-live="polite">
+            <div class="payment-card-head">
+              <span>支付单状态</span>
+              <b class="payment-status-badge idle" id="paymentStatusBadge">未创建</b>
+            </div>
+            <div class="payment-summary-row">
+              <span>账户余额</span>
+              <strong id="paymentCurrentBalance">¥0.00</strong>
+            </div>
+            <div class="payment-summary-row">
+              <span>本次充值</span>
+              <strong id="paymentSelectedAmount">¥50.00</strong>
+            </div>
+            <div class="payment-summary-row">
+              <span>支付单号</span>
+              <strong id="paymentOrder">未创建</strong>
+            </div>
+            <small id="paymentHint">选择金额后点击创建支付单，再按页面提示扫码付款。</small>
           </section>
         </div>
         <div class="payment-manual" id="paymentManual" hidden>
           <div class="payment-qr-panel">
             <span>扫码付款</span>
             <img id="paymentQrImage" alt="收款二维码" hidden />
-            <small>付款金额需与支付单一致</small>
+            <small>付款金额必须与支付单一致</small>
           </div>
           <div class="payment-proof-panel">
             <div class="payment-reference-line">
               <div>
-                <span>付款备注</span>
+                <span>付款备注（必须填写）</span>
                 <strong id="paymentReference">创建支付单后生成</strong>
                 <small id="paymentAccount">请按页面提示完成付款，付款备注务必填写支付单号</small>
               </div>
               <button class="secondary-action mini-action" id="copyPaymentRefBtn" type="button">复制</button>
             </div>
+            <ul class="payment-checklist">
+              <li>扫码付款时，备注请填写上方支付单号。</li>
+              <li>付款完成后，填写交易号或付款账号信息。</li>
+              <li>提交审核后请勿重复创建同金额支付单。</li>
+            </ul>
             <label class="payment-proof-field">
               <span>付款交易号</span>
               <input id="paymentTradeNo" type="text" maxlength="80" placeholder="填写支付宝交易号或订单号" />

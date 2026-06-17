@@ -89,6 +89,10 @@ const createPaymentBtn = document.querySelector("#createPaymentBtn");
 const confirmPaymentBtn = document.querySelector("#confirmPaymentBtn");
 const paymentOrder = document.querySelector("#paymentOrder");
 const paymentHint = document.querySelector("#paymentHint");
+const paymentSelectedAmount = document.querySelector("#paymentSelectedAmount");
+const paymentCurrentBalance = document.querySelector("#paymentCurrentBalance");
+const paymentStatusBadge = document.querySelector("#paymentStatusBadge");
+const paymentSteps = ["#paymentStepAmount", "#paymentStepPay", "#paymentStepReview"].map((selector) => document.querySelector(selector));
 const paymentManual = document.querySelector("#paymentManual");
 const paymentQrImage = document.querySelector("#paymentQrImage");
 const paymentReference = document.querySelector("#paymentReference");
@@ -851,6 +855,97 @@ confirmPaymentBtn.addEventListener("click", async () => {
     showToast(error.message);
   }
 });
+
+function paymentCleanText(value, fallback) {
+  const text = String(value || "").trim();
+  const questionMarks = (text.match(/\?/g) || []).length;
+  if (!text || /^[?\s]+$/.test(text) || questionMarks >= Math.max(6, text.length * 0.45)) return fallback;
+  return text;
+}
+
+function setPaymentStage(stage) {
+  paymentSteps.forEach((item, index) => {
+    if (!item) return;
+    item.classList.toggle("active", index === stage);
+    item.classList.toggle("done", index < stage);
+  });
+}
+
+function setPaymentBadge(text, mode = "idle") {
+  if (!paymentStatusBadge) return;
+  paymentStatusBadge.textContent = text;
+  paymentStatusBadge.className = `payment-status-badge ${mode}`;
+}
+
+function setPaymentText(element, text) {
+  if (element && element.textContent !== text) element.textContent = text;
+}
+
+function syncPaymentUiExtras() {
+  setPaymentText(paymentSelectedAmount, formatMoney(state.paymentAmount));
+  setPaymentText(paymentCurrentBalance, formatMoney(state.balance));
+
+  if (!state.pendingPayment?.payment_id) {
+    setPaymentText(paymentOrder, "未创建");
+    setPaymentText(paymentHint, "选择金额后点击创建支付单。");
+    setPaymentStage(0);
+    setPaymentBadge("未创建", "idle");
+    return;
+  }
+
+  const payment = state.pendingPayment;
+  setPaymentText(paymentOrder, payment.payment_id);
+  const submitted = submitPaymentNoticeBtn.disabled && /已提交|等待|核账/.test(submitPaymentNoticeBtn.textContent);
+  if (submitted) {
+    setPaymentText(paymentHint, "付款信息已提交，管理员核对到账后会为账户充值。");
+    setPaymentStage(2);
+    setPaymentBadge("待核账", "review");
+    return;
+  }
+
+  const amountText = formatMoney(payment.amount || state.paymentAmount);
+  setPaymentText(paymentHint, state.mockPaymentsEnabled
+    ? `待支付 ${amountText}，演示交易号 ${payment.mock_trade_no || "-"}`
+    : paymentCleanText(payment.payment_message, `待支付 ${amountText}，请扫码付款并提交交易号。`));
+  setPaymentStage(1);
+  setPaymentBadge("待支付", "pending");
+
+  if (paymentReference && paymentReference.textContent.includes("鍒涘缓")) {
+    setPaymentText(paymentReference, payment.payment_reference || payment.payment_id);
+  }
+  if (paymentAccount && paymentAccount.textContent.includes("璇")) {
+    setPaymentText(paymentAccount, paymentCleanText(payment.payment_account, "请以扫码页显示的收款方为准，付款备注务必填写支付单号。"));
+  }
+}
+
+document.querySelectorAll("[data-pay-amount]").forEach((button) => {
+  button.addEventListener("click", () => window.setTimeout(syncPaymentUiExtras, 0));
+});
+
+createPaymentBtn.addEventListener("click", () => {
+  createPaymentBtn.disabled = true;
+  const originalText = createPaymentBtn.textContent;
+  createPaymentBtn.textContent = "创建中...";
+  window.setTimeout(() => {
+    createPaymentBtn.disabled = false;
+    createPaymentBtn.textContent = originalText || "创建支付单";
+    syncPaymentUiExtras();
+  }, 900);
+});
+
+submitPaymentNoticeBtn.addEventListener("click", () => {
+  window.setTimeout(syncPaymentUiExtras, 900);
+});
+
+if (paymentModal) {
+  new MutationObserver(() => window.setTimeout(syncPaymentUiExtras, 0)).observe(paymentModal, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ["hidden"],
+  });
+}
 
 function setAuthMode(mode) {
   state.authMode = mode;
