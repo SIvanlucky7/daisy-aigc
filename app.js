@@ -675,7 +675,7 @@ function renderManualPayment(payment) {
   }
 }
 
-function paymentStatusLabel(payment) {
+function paymentStatusLabelClean(payment) {
   if (payment.status === "paid") return "已到账";
   if (payment.status === "canceled") return "已驳回";
   if (payment.notified_at) return "待核账";
@@ -946,6 +946,44 @@ if (paymentModal) {
     attributeFilter: ["hidden"],
   });
 }
+
+function paymentStatusLabel(payment) {
+  if (payment.status === "paid") return "已到账";
+  if (payment.status === "canceled") return "已驳回";
+  if (payment.notified_at) return "待核账";
+  if (payment.status === "pending") return "待支付";
+  return payment.status || "-";
+}
+
+function paymentStatusClassClean(payment) {
+  if (payment.status === "paid") return "paid";
+  if (payment.status === "canceled") return "canceled";
+  if (payment.notified_at) return "review";
+  return "pending";
+}
+
+renderPaymentHistory = function renderPaymentHistoryClean(payments) {
+  paymentHistoryList.innerHTML = payments.length
+    ? payments.map((payment) => {
+        const proof = payment.user_trade_no || payment.user_payment_note || "";
+        const proofText = proof ? ` · 凭证 ${proof}` : "";
+        const cancelText = payment.cancel_note ? ` · 原因 ${payment.cancel_note}` : "";
+        const paidText = payment.paid_at ? ` · 到账 ${formatTime(payment.paid_at)}` : "";
+        const notifyText = payment.notified_at ? ` · 提交 ${formatTime(payment.notified_at)}` : "";
+        const canceledText = payment.canceled_at ? ` · 驳回 ${formatTime(payment.canceled_at)}` : "";
+        return `
+          <div class="payment-history-row">
+            <span>
+              <strong>${escapeHtml(payment.payment_id)}</strong>
+              <small><em class="payment-history-status ${paymentStatusClassClean(payment)}">${escapeHtml(paymentStatusLabelClean(payment))}</em>${escapeHtml(proofText)}${escapeHtml(cancelText)}</small>
+              <small>${escapeHtml(formatTime(payment.created_at))}${escapeHtml(notifyText)}${escapeHtml(paidText)}${escapeHtml(canceledText)}</small>
+            </span>
+            <b>${escapeHtml(formatMoney(payment.amount))}</b>
+          </div>
+        `;
+      }).join("")
+    : '<div class="empty-orders">暂无充值记录</div>';
+};
 
 function setAuthMode(mode) {
   state.authMode = mode;
