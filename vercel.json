@@ -1,0 +1,11 @@
+{
+  "outputDirectory": "dist",
+  "cleanUrls": true,
+  "rewrites": [
+    { "source": "/login", "destination": "/login/index.html" },
+    { "source": "/register", "destination": "/register/index.html" },
+    { "source": "/forgot-password", "destination": "/forgot-password/index.html" },
+    { "source": "/reset-password", "destination": "/reset-password/index.html" },
+    { "source": "/dashboard", "destination": "/dashboard/index.html" }
+  ]
+}

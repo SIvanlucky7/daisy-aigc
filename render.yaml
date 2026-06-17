@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: daisy-aigc-api
+    env: python
+    plan: free
+    buildCommand: python -m py_compile server.py
+    startCommand: python server.py
+    envVars:
+      - key: DAISY_DB_FILE
+        value: /var/data/daisy.db
+      - key: DAISY_ORDERS_FILE
+        value: /var/data/orders.jsonl
+      - key: DAISY_ALLOWED_ORIGINS
+        value: https://daisy-aigc.vercel.app
+      - key: DAISY_DEMO_FALLBACK
+        value: "1"
+      - key: DAISY_PAYMENT_PROVIDER
+        value: mock
+      - key: DAISY_ENABLE_MOCK_PAYMENT
+        value: "1"
+      - key: VITE_SUPABASE_URL
+        sync: false
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false

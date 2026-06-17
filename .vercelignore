@@ -1,0 +1,17 @@
+.env
+.env.*
+.git
+.gitignore
+.tools/
+__pycache__/
+node_modules/
+daisy.db
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.pyc
+preview-*.png
+chrome-screenshot.log
+server*.log
+server*.err.log

@@ -1,0 +1,11 @@
+__pycache__/
+.tools/
+node_modules/
+dist/
+vendor/
+.env
+*.pyc
+*.log
+daisy.db
+orders.jsonl
+preview-*.png

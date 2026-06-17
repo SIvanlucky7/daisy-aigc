@@ -1,0 +1,14 @@
+{
+  "name": "daisy-aigc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "python server.py",
+    "build": "node scripts/build-static.mjs",
+    "preview": "python server.py"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.50.0"
+  }
+}
