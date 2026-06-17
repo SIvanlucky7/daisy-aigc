@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import hmac
 import secrets
 import sqlite3
 import time
@@ -107,6 +108,8 @@ ADMIN_EMAIL_LIST = [
 ADMIN_EMAILS = set(ADMIN_EMAIL_LIST)
 ADMIN_BOOTSTRAP_EMAIL = ADMIN_EMAIL_LIST[0] if ADMIN_EMAIL_LIST else "admin@daisy.local"
 ADMIN_BOOTSTRAP_PASSWORD = os.getenv("DAISY_ADMIN_PASSWORD", "admin123456")
+ADMIN_INITIAL_BALANCE_CENTS = int(os.getenv("DAISY_ADMIN_INITIAL_BALANCE_CENTS", "0"))
+STATELESS_SESSIONS = os.getenv("DAISY_STATELESS_SESSIONS", "0") == "1"
 SUPABASE_URL = (
     os.getenv("VITE_SUPABASE_URL", "").strip()
     or os.getenv("NEXT_PUBLIC_SUPABASE_URL", "").strip()
@@ -542,6 +545,11 @@ def init_db() -> None:
                 "UPDATE users SET password_salt = ?, password_hash = ? WHERE id = ?",
                 (salt, password_hash, admin_row["id"]),
             )
+        if ADMIN_INITIAL_BALANCE_CENTS > 0:
+            conn.execute(
+                "UPDATE users SET balance_cents = max(balance_cents, ?) WHERE email = ?",
+                (ADMIN_INITIAL_BALANCE_CENTS, ADMIN_BOOTSTRAP_EMAIL),
+            )
 
 
 def hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
@@ -560,6 +568,8 @@ def hash_api_key(api_key: str) -> str:
 
 
 def create_session(user_id: str) -> str:
+    if STATELESS_SESSIONS:
+        return create_stateless_session(user_id)
     session_id = secrets.token_urlsafe(32)
     now = int(time.time())
     with db() as conn:
@@ -574,8 +584,41 @@ def create_session(user_id: str) -> str:
 def destroy_session(session_id: str | None) -> None:
     if not session_id:
         return
+    if STATELESS_SESSIONS:
+        return
     with db() as conn:
         conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+
+
+def session_secret() -> str:
+    return PAYMENT_WEBHOOK_SECRET or ADMIN_BOOTSTRAP_PASSWORD or "daisy-session-secret"
+
+
+def create_stateless_session(user_id: str) -> str:
+    expires_at = int(time.time()) + SESSION_TTL_SECONDS
+    body = f"{user_id}:{expires_at}"
+    signature = hmac.new(session_secret().encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"v1:{body}:{signature}"
+
+
+def verify_stateless_session(token: str) -> str | None:
+    parts = token.split(":")
+    if len(parts) != 4 or parts[0] != "v1":
+        return None
+    _, user_id, expires_at_raw, signature = parts
+    try:
+        expires_at = int(expires_at_raw)
+    except ValueError:
+        return None
+    if expires_at < int(time.time()):
+        return None
+    body = f"{user_id}:{expires_at}"
+    expected = hmac.new(session_secret().encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        return None
+    with db() as conn:
+        exists = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+    return user_id if exists else None
 
 
 def register_user(email: str, password: str, accept_terms: bool = False) -> dict:
@@ -2366,6 +2409,9 @@ class DaisyHandler(SimpleHTTPRequestHandler):
         if not morsel:
             return DEFAULT_USER_ID, False, None
         session_id = morsel.value
+        if STATELESS_SESSIONS:
+            user_id = verify_stateless_session(session_id)
+            return (user_id, True, session_id) if user_id else (DEFAULT_USER_ID, False, None)
         now = int(time.time())
         with db() as conn:
             row = conn.execute("SELECT user_id, expires_at FROM sessions WHERE id = ?", (session_id,)).fetchone()
