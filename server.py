@@ -2462,36 +2462,52 @@ def readiness_report() -> dict:
 
 def admin_summary() -> dict:
     today_start = int(time.time()) - 24 * 60 * 60
+    warnings = []
     with db() as conn:
+        def scalar(sql: str, params=(), default=0):
+            try:
+                row = conn.execute(sql, params).fetchone()
+                return row[0] if row else default
+            except Exception as exc:
+                warnings.append(str(exc))
+                return default
+
+        def rows(sql: str, params=()):
+            try:
+                return conn.execute(sql, params).fetchall()
+            except Exception as exc:
+                warnings.append(str(exc))
+                return []
+
         stats = {
-            "users": conn.execute("SELECT COUNT(*) FROM users").fetchone()[0],
-            "orders": conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
-            "completed_orders": conn.execute("SELECT COUNT(*) FROM orders WHERE status = 'completed'").fetchone()[0],
-            "stored_results": conn.execute("SELECT COUNT(*) FROM orders WHERE result_text IS NOT NULL AND result_text != ''").fetchone()[0],
-            "paid_payments": conn.execute("SELECT COUNT(*) FROM payments WHERE status = 'paid'").fetchone()[0],
-            "open_tickets": conn.execute("SELECT COUNT(*) FROM support_tickets WHERE status IN ('open', 'processing')").fetchone()[0],
-            "api_calls_24h": conn.execute("SELECT COUNT(*) FROM api_usage WHERE created_at >= ?", (today_start,)).fetchone()[0],
-            "revenue_cents": conn.execute("SELECT COALESCE(SUM(amount_cents), 0) FROM payments WHERE status = 'paid'").fetchone()[0],
-            "order_debit_cents": conn.execute("SELECT COALESCE(SUM(amount_cents), 0) FROM orders WHERE status = 'completed'").fetchone()[0],
-            "balance_pool_cents": conn.execute("SELECT COALESCE(SUM(balance_cents), 0) FROM users").fetchone()[0],
+            "users": scalar("SELECT COUNT(*) FROM users"),
+            "orders": scalar("SELECT COUNT(*) FROM orders"),
+            "completed_orders": scalar("SELECT COUNT(*) FROM orders WHERE status = 'completed'"),
+            "stored_results": scalar("SELECT COUNT(*) FROM orders WHERE result_text IS NOT NULL AND result_text != ''"),
+            "paid_payments": scalar("SELECT COUNT(*) FROM payments WHERE status = 'paid'"),
+            "open_tickets": scalar("SELECT COUNT(*) FROM support_tickets WHERE status IN ('open', 'processing')"),
+            "api_calls_24h": scalar("SELECT COUNT(*) FROM api_usage WHERE created_at >= ?", (today_start,)),
+            "revenue_cents": scalar("SELECT COALESCE(SUM(amount_cents), 0) FROM payments WHERE status = 'paid'"),
+            "order_debit_cents": scalar("SELECT COALESCE(SUM(amount_cents), 0) FROM orders WHERE status = 'completed'"),
+            "balance_pool_cents": scalar("SELECT COALESCE(SUM(balance_cents), 0) FROM users"),
         }
-        users = conn.execute(
+        users = rows(
             """
             SELECT id, email, display_name, balance_cents, created_at
             FROM users
             ORDER BY created_at DESC
             LIMIT 12
             """
-        ).fetchall()
-        orders = conn.execute(
+        )
+        orders = rows(
             """
             SELECT order_id, user_id, service, platform, chars, amount_cents, engine, status, error, created_at, completed_at
             FROM orders
             ORDER BY created_at DESC
             LIMIT 12
             """
-        ).fetchall()
-        payments = conn.execute(
+        )
+        payments = rows(
             """
             SELECT payments.payment_id, payments.user_id, payments.amount_cents, payments.provider,
                    payments.status, payments.provider_trade_no, payments.user_trade_no,
@@ -2503,16 +2519,16 @@ def admin_summary() -> dict:
             ORDER BY payments.created_at DESC
             LIMIT 12
             """
-        ).fetchall()
-        ledger = conn.execute(
+        )
+        ledger = rows(
             """
             SELECT id, user_id, type, amount_cents, balance_after_cents, ref_id, created_at, note
             FROM ledger
             ORDER BY id DESC
             LIMIT 12
             """
-        ).fetchall()
-        api_usage = conn.execute(
+        )
+        api_usage = rows(
             """
             SELECT api_usage.id, api_usage.api_key_id, api_usage.user_id, api_usage.order_id,
                    api_usage.status, api_usage.chars, api_usage.amount_cents, api_usage.error,
@@ -2523,8 +2539,8 @@ def admin_summary() -> dict:
             ORDER BY api_usage.id DESC
             LIMIT 12
             """
-        ).fetchall()
-        admin_audit = conn.execute(
+        )
+        admin_audit = rows(
             """
             SELECT admin_audit.id, admin_audit.admin_user_id, admin_audit.action,
                    admin_audit.target_user_id, admin_audit.target_email,
@@ -2535,8 +2551,8 @@ def admin_summary() -> dict:
             ORDER BY admin_audit.id DESC
             LIMIT 12
             """
-        ).fetchall()
-        support_tickets = conn.execute(
+        )
+        support_tickets = rows(
             """
             SELECT ticket_id, user_id, email, category, subject, message, ref_id,
                    status, admin_note, created_at, resolved_at
@@ -2544,7 +2560,7 @@ def admin_summary() -> dict:
             ORDER BY created_at DESC
             LIMIT 12
             """
-        ).fetchall()
+        )
 
     def money(row: sqlite3.Row, key: str = "amount_cents") -> dict:
         item = dict(row)
@@ -2582,6 +2598,7 @@ def admin_summary() -> dict:
         "admin_audit": [money(row) for row in admin_audit],
         "support_tickets": [dict(row) for row in support_tickets],
         "readiness": readiness_report(),
+        "warnings": warnings[:20],
     }
 
 
