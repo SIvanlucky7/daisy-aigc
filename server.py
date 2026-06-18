@@ -861,7 +861,7 @@ def register_user(
     if not accept_terms:
         raise ValueError("请先阅读并同意用户协议和隐私政策")
     if require_supabase_admin and not SUPABASE_ADMIN_ENABLED:
-        raise ValueError("Supabase no-email signup is not configured. Set SUPABASE_SERVICE_ROLE_KEY on the backend, or disable email confirmation in Supabase.")
+        raise ValueError("Supabase no-email signup is not configured. Set SUPABASE_SERVICE_ROLE_KEY on the backend.")
     salt, password_hash = hash_password(password)
     now = int(time.time())
     with db() as conn:
