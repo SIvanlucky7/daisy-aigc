@@ -141,6 +141,8 @@ SUPABASE_ANON_KEY = (
     or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY", "").strip()
 )
 SUPABASE_AUTH_ENABLED = bool(SUPABASE_URL and SUPABASE_ANON_KEY)
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_ADMIN_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 PUBLIC_BASE_URL = os.getenv("DAISY_PUBLIC_BASE_URL", "").strip().rstrip("/")
 REQUIRE_AUTH_FOR_BILLABLE = os.getenv("DAISY_REQUIRE_AUTH_FOR_BILLABLE", "1") != "0"
 DEFAULT_CORS_ORIGINS = "http://localhost:9910,http://127.0.0.1:9910,https://daisy-aigc.vercel.app,https://sivanlucky7.github.io"
@@ -791,7 +793,66 @@ def verify_stateless_session(token: str) -> str | None:
     return user_id if exists else None
 
 
-def register_user(email: str, password: str, accept_terms: bool = False) -> dict:
+def supabase_admin_headers() -> dict:
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    }
+
+
+def supabase_admin_find_user_by_email(email: str) -> dict | None:
+    if not SUPABASE_ADMIN_ENABLED:
+        return None
+    lookup_url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/admin/users?page=1&per_page=1000"
+    payload = http_json("GET", lookup_url, headers=supabase_admin_headers(), timeout=20)
+    users = payload.get("users", []) if isinstance(payload, dict) else payload
+    if not isinstance(users, list):
+        return None
+    email = email.strip().lower()
+    for item in users:
+        if isinstance(item, dict) and str(item.get("email") or "").strip().lower() == email:
+            return item
+    return None
+
+
+def supabase_admin_update_confirmed_user(user_id: str, password: str) -> dict:
+    update_url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/admin/users/{urllib.parse.quote(user_id, safe='')}"
+    payload = {"password": password, "email_confirm": True}
+    return http_json("PUT", update_url, payload, headers=supabase_admin_headers(), timeout=20) or {"id": user_id}
+
+
+def supabase_admin_upsert_confirmed_user(email: str, password: str) -> dict | None:
+    if not SUPABASE_ADMIN_ENABLED:
+        return None
+    existing = supabase_admin_find_user_by_email(email)
+    if existing and existing.get("id"):
+        updated = supabase_admin_update_confirmed_user(str(existing["id"]), password)
+        return updated if isinstance(updated, dict) and updated.get("id") else existing
+
+    create_url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/admin/users"
+    create_payload = {
+        "email": email,
+        "password": password,
+        "email_confirm": True,
+        "user_metadata": {"display_name": email.split("@", 1)[0]},
+    }
+    try:
+        created = http_json("POST", create_url, create_payload, headers=supabase_admin_headers(), timeout=20)
+    except RuntimeError:
+        existing = supabase_admin_find_user_by_email(email)
+        if existing and existing.get("id"):
+            updated = supabase_admin_update_confirmed_user(str(existing["id"]), password)
+            return updated if isinstance(updated, dict) and updated.get("id") else existing
+        raise
+    return created if isinstance(created, dict) else None
+
+
+def register_user(
+    email: str,
+    password: str,
+    accept_terms: bool = False,
+    require_supabase_admin: bool = False,
+) -> dict:
     email = email.strip().lower()
     if "@" not in email or "." not in email.rsplit("@", 1)[-1]:
         raise ValueError("请输入有效邮箱")
@@ -799,20 +860,47 @@ def register_user(email: str, password: str, accept_terms: bool = False) -> dict
         raise ValueError("密码至少 6 位")
     if not accept_terms:
         raise ValueError("请先阅读并同意用户协议和隐私政策")
+    if require_supabase_admin and not SUPABASE_ADMIN_ENABLED:
+        raise ValueError("Supabase no-email signup is not configured. Set SUPABASE_SERVICE_ROLE_KEY on the backend, or disable email confirmation in Supabase.")
     salt, password_hash = hash_password(password)
-    user_id = uuid4().hex
     now = int(time.time())
+    with db() as conn:
+        if conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone():
+            raise ValueError("该邮箱已注册")
+
+    supabase_user = None
+    if SUPABASE_ADMIN_ENABLED:
+        try:
+            supabase_user = supabase_admin_upsert_confirmed_user(email, password)
+        except RuntimeError as exc:
+            if require_supabase_admin:
+                raise ValueError(f"Supabase no-email signup failed: {exc}") from exc
+            supabase_user = None
+    supabase_user_id = str(supabase_user.get("id")) if isinstance(supabase_user, dict) and supabase_user.get("id") else None
+    user_id = local_supabase_user_id(supabase_user_id) if supabase_user_id else uuid4().hex
     try:
         with db() as conn:
             conn.execute(
                 """
                 INSERT INTO users (
                   id, display_name, balance_cents, created_at, email,
-                  password_salt, password_hash, terms_accepted_at
+                  password_salt, password_hash, terms_accepted_at,
+                  supabase_user_id, login_provider
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, email.split("@", 1)[0], REGISTRATION_BONUS_CENTS, now, email, salt, password_hash, now),
+                (
+                    user_id,
+                    email.split("@", 1)[0],
+                    REGISTRATION_BONUS_CENTS,
+                    now,
+                    email,
+                    salt,
+                    password_hash,
+                    now,
+                    supabase_user_id,
+                    "supabase" if supabase_user_id else "local",
+                ),
             )
             if REGISTRATION_BONUS_CENTS:
                 conn.execute(
@@ -848,7 +936,7 @@ def log_login_attempt(email: str, ip: str, success: bool) -> None:
         )
 
 
-def login_user(email: str, password: str) -> dict:
+def login_user(email: str, password: str, require_supabase_admin: bool = False) -> dict:
     email = email.strip().lower()
     with db() as conn:
         row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
@@ -856,6 +944,20 @@ def login_user(email: str, password: str) -> dict:
         raise ValueError("邮箱或密码错误")
     if not verify_password(password, row["password_salt"], row["password_hash"]):
         raise ValueError("邮箱或密码错误")
+    if require_supabase_admin:
+        if not SUPABASE_ADMIN_ENABLED:
+            raise ValueError("Supabase no-email login bootstrap is not configured. Set SUPABASE_SERVICE_ROLE_KEY on the backend.")
+        try:
+            supabase_user = supabase_admin_upsert_confirmed_user(email, password)
+        except RuntimeError as exc:
+            raise ValueError(f"Supabase no-email login bootstrap failed: {exc}") from exc
+        supabase_user_id = str(supabase_user.get("id")) if isinstance(supabase_user, dict) and supabase_user.get("id") else None
+        if supabase_user_id:
+            with db() as conn:
+                conn.execute(
+                    "UPDATE users SET supabase_user_id = ?, login_provider = 'supabase' WHERE id = ?",
+                    (supabase_user_id, row["id"]),
+                )
     return user_snapshot(row["id"], authenticated=True)
 
 
@@ -3008,6 +3110,7 @@ class DaisyHandler(SimpleHTTPRequestHandler):
                     "mock_payments_enabled": MOCK_PAYMENTS_ENABLED,
                     "wechat_login_enabled": False,
                     "supabase_auth_enabled": SUPABASE_AUTH_ENABLED,
+                    "supabase_admin_register_enabled": SUPABASE_ADMIN_ENABLED,
                     "billable_auth_required": REQUIRE_AUTH_FOR_BILLABLE,
                     "database": database_status(),
                     "app_version": APP_VERSION,
@@ -3025,6 +3128,7 @@ class DaisyHandler(SimpleHTTPRequestHandler):
                     "demo_fallback": DEMO_FALLBACK,
                     "wechat_login_enabled": False,
                     "supabase_auth_enabled": SUPABASE_AUTH_ENABLED,
+                    "supabase_admin_register_enabled": SUPABASE_ADMIN_ENABLED,
                     "billable_auth_required": REQUIRE_AUTH_FOR_BILLABLE,
                     "supabase_url": SUPABASE_URL,
                     "supabase_anon_key": SUPABASE_ANON_KEY,
@@ -3232,6 +3336,7 @@ class DaisyHandler(SimpleHTTPRequestHandler):
                     str(payload.get("email", "")),
                     str(payload.get("password", "")),
                     bool(payload.get("accept_terms")),
+                    bool(payload.get("require_supabase_admin")),
                 )
                 new_session_id = create_session(user["user_id"])
                 self.send_json(200, user_snapshot(user["user_id"], authenticated=True), {"Set-Cookie": self.session_cookie_header(new_session_id)})
@@ -3253,7 +3358,7 @@ class DaisyHandler(SimpleHTTPRequestHandler):
                     self.send_json(429, {"error": "登录失败次数过多，请稍后再试"})
                     return
                 try:
-                    user = login_user(email, str(payload.get("password", "")))
+                    user = login_user(email, str(payload.get("password", "")), bool(payload.get("require_supabase_admin")))
                 except ValueError:
                     log_login_attempt(email, ip, False)
                     raise
