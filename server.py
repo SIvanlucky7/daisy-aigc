@@ -41,6 +41,7 @@ except ImportError:
 
 
 ROOT = Path(__file__).resolve().parent
+APP_VERSION = "2026-06-19-admin-health-1"
 
 
 def load_dotenv() -> None:
@@ -2810,6 +2811,8 @@ class DaisyHandler(SimpleHTTPRequestHandler):
                     "supabase_auth_enabled": SUPABASE_AUTH_ENABLED,
                     "billable_auth_required": REQUIRE_AUTH_FOR_BILLABLE,
                     "database": database_status(),
+                    "app_version": APP_VERSION,
+                    "commit": os.getenv("VERCEL_GIT_COMMIT_SHA", ""),
                 },
             )
             return
