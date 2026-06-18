@@ -12,8 +12,11 @@ authorization that allows your commercial deployment.
 
 from __future__ import annotations
 
+import base64
+import difflib
 import json
 import os
+import re
 import asyncio
 import hashlib
 import hmac
@@ -41,7 +44,7 @@ except ImportError:
 
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "2026-06-19-admin-health-1"
+APP_VERSION = "2026-06-19-docx-report-1"
 
 
 def load_dotenv() -> None:
@@ -140,7 +143,7 @@ SUPABASE_ANON_KEY = (
 SUPABASE_AUTH_ENABLED = bool(SUPABASE_URL and SUPABASE_ANON_KEY)
 PUBLIC_BASE_URL = os.getenv("DAISY_PUBLIC_BASE_URL", "").strip().rstrip("/")
 REQUIRE_AUTH_FOR_BILLABLE = os.getenv("DAISY_REQUIRE_AUTH_FOR_BILLABLE", "1") != "0"
-DEFAULT_CORS_ORIGINS = "http://localhost:9910,http://127.0.0.1:9910,https://daisy-aigc.vercel.app"
+DEFAULT_CORS_ORIGINS = "http://localhost:9910,http://127.0.0.1:9910,https://daisy-aigc.vercel.app,https://sivanlucky7.github.io"
 ALLOWED_CORS_ORIGINS = {
     origin.strip().rstrip("/")
     for origin in os.getenv("DAISY_ALLOWED_ORIGINS", DEFAULT_CORS_ORIGINS).split(",")
@@ -650,6 +653,7 @@ def init_db() -> None:
             "input_type": "ALTER TABLE orders ADD COLUMN input_type TEXT NOT NULL DEFAULT 'text'",
             "source_filename": "ALTER TABLE orders ADD COLUMN source_filename TEXT",
             "report_filename": "ALTER TABLE orders ADD COLUMN report_filename TEXT",
+            "result_docx_base64": "ALTER TABLE orders ADD COLUMN result_docx_base64 TEXT",
         }.items():
             if column not in order_columns:
                 conn.execute(ddl)
@@ -1452,39 +1456,85 @@ def xml_escape(value: str) -> str:
     )
 
 
-def docx_from_text(text: str) -> bytes:
-    paragraphs = [part.strip() for part in text.replace("\r", "\n").split("\n")]
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def w_tag(name: str) -> str:
+    return f"{{{W_NS}}}{name}"
+
+
+def w_attr(name: str) -> str:
+    return f"{{{W_NS}}}{name}"
+
+
+def split_text_paragraphs(text: str) -> list[str]:
+    normalized = str(text or "").replace("\r", "\n")
+    return [part.strip() for part in re.split(r"\n+", normalized) if part.strip()]
+
+
+def docx_run(text: str, red: bool = False, bold: bool = False) -> str:
+    props = []
+    if red:
+        props.append('<w:color w:val="FF0000"/>')
+    if bold:
+        props.append('<w:b/>')
+    rpr = f"<w:rPr>{''.join(props)}</w:rPr>" if props else ""
+    return f'<w:r>{rpr}<w:t xml:space="preserve">{xml_escape(text)}</w:t></w:r>'
+
+
+def docx_from_paragraphs(paragraphs: list[dict] | list[tuple] | list[str]) -> bytes:
     body = []
-    for paragraph in paragraphs:
+    for item in paragraphs:
+        if isinstance(item, dict):
+            paragraph = str(item.get("text", ""))
+            red = bool(item.get("red"))
+            bold = bool(item.get("bold"))
+        elif isinstance(item, tuple):
+            paragraph = str(item[0] if item else "")
+            red = bool(item[1]) if len(item) > 1 else False
+            bold = bool(item[2]) if len(item) > 2 else False
+        else:
+            paragraph = str(item)
+            red = False
+            bold = False
         if paragraph:
-            body.append(f"<w:p><w:r><w:t xml:space=\"preserve\">{xml_escape(paragraph)}</w:t></w:r></w:p>")
+            runs = []
+            for idx, piece in enumerate(paragraph.split("\n")):
+                if idx:
+                    runs.append("<w:r><w:br/></w:r>")
+                runs.append(docx_run(piece, red=red, bold=bold))
+            body.append(f"<w:p>{''.join(runs)}</w:p>")
         else:
             body.append("<w:p/>")
     if not body:
         body.append("<w:p/>")
-    document_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    document_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
     {''.join(body)}
     <w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>
   </w:body>
-</w:document>"""
-    content_types = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+</w:document>'''
+    content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
   <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-</Types>"""
-    rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+</Types>'''
+    rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
-</Relationships>"""
+</Relationships>'''
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("[Content_Types].xml", content_types)
         archive.writestr("_rels/.rels", rels)
         archive.writestr("word/document.xml", document_xml)
     return buffer.getvalue()
+
+
+def docx_from_text(text: str, red: bool = False) -> bytes:
+    return docx_from_paragraphs([{"text": paragraph, "red": red} for paragraph in split_text_paragraphs(text)])
 
 
 def extract_txt(data: bytes) -> str:
@@ -1496,17 +1546,53 @@ def extract_txt(data: bytes) -> str:
     return data.decode("utf-8", errors="ignore")
 
 
-def extract_docx(data: bytes) -> str:
+def run_is_marked(rpr) -> bool:
+    if rpr is None:
+        return False
+    color = rpr.find(w_tag("color"))
+    if color is not None:
+        value = (color.get(w_attr("val")) or "").strip().lower()
+        if value and value not in {"auto", "000000", "ffffff"}:
+            return True
+    highlight = rpr.find(w_tag("highlight"))
+    if highlight is not None:
+        value = (highlight.get(w_attr("val")) or "").strip().lower()
+        if value and value != "none":
+            return True
+    shading = rpr.find(w_tag("shd"))
+    if shading is not None:
+        fill = (shading.get(w_attr("fill")) or "").strip().lower()
+        if fill and fill not in {"auto", "ffffff", "000000"}:
+            return True
+    return False
+
+
+def docx_paragraphs(data: bytes, marked_only: bool = False) -> list[dict]:
     with zipfile.ZipFile(BytesIO(data)) as archive:
         xml = archive.read("word/document.xml")
     root = ET.fromstring(xml)
-    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
     paragraphs = []
-    for para in root.findall(".//w:p", ns):
-        texts = [node.text or "" for node in para.findall(".//w:t", ns)]
-        if texts:
-            paragraphs.append("".join(texts))
-    return "\n".join(paragraphs)
+    for para in root.findall(f".//{{{W_NS}}}p"):
+        chunks = []
+        marked = False
+        for run in para.findall(f".//{{{W_NS}}}r"):
+            rpr = run.find(w_tag("rPr"))
+            marked = marked or run_is_marked(rpr)
+            for node in run:
+                if node.tag == w_tag("t"):
+                    chunks.append(node.text or "")
+                elif node.tag == w_tag("tab"):
+                    chunks.append("\t")
+                elif node.tag in {w_tag("br"), w_tag("cr")}:
+                    chunks.append("\n")
+        paragraph = "".join(chunks).strip()
+        if paragraph and (not marked_only or marked):
+            paragraphs.append({"text": paragraph, "marked": marked})
+    return paragraphs
+
+
+def extract_docx(data: bytes) -> str:
+    return "\n".join(item["text"] for item in docx_paragraphs(data))
 
 
 def extract_pdf(data: bytes) -> str:
@@ -1550,6 +1636,117 @@ def extract_file(filename: str, data: bytes) -> dict:
         "text": text,
     }
 
+
+def decode_upload_base64(value: str) -> bytes:
+    raw = str(value or "").strip()
+    if not raw:
+        return b""
+    if "," in raw and raw.lower().startswith("data:"):
+        raw = raw.split(",", 1)[1]
+    try:
+        data = base64.b64decode(raw, validate=False)
+    except Exception as exc:
+        raise ValueError("上传文件内容解析失败，请重新选择文件") from exc
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError(f"文件过大，当前限制 {MAX_UPLOAD_BYTES // 1024 // 1024}MB")
+    return data
+
+
+def normalize_for_match(value: str) -> str:
+    return re.sub(r"\W+", "", str(value or "").lower(), flags=re.UNICODE)
+
+
+def paragraph_matches_target(paragraph: str, target: str) -> bool:
+    para = normalize_for_match(paragraph)
+    tgt = normalize_for_match(target)
+    if len(para) < 12 or len(tgt) < 12:
+        return False
+    if tgt in para or para in tgt:
+        return True
+    if len(tgt) > 240:
+        tgt = tgt[:240]
+    return difflib.SequenceMatcher(None, para[:300], tgt).ratio() >= 0.58
+
+
+def report_target_texts(report_filename: str | None, report_data: bytes, report_text: str) -> list[str]:
+    targets: list[str] = []
+    if report_data and str(report_filename or "").lower().endswith(".docx"):
+        try:
+            targets.extend(item["text"] for item in docx_paragraphs(report_data, marked_only=True))
+        except Exception:
+            pass
+    keyword_pattern = re.compile(r"(AIGC|AI|疑似|风险|机器|生成|检测|总体|占比|率|%|红色|橙色|黄色)", re.I)
+    for paragraph in split_text_paragraphs(report_text):
+        if keyword_pattern.search(paragraph):
+            targets.append(paragraph)
+    unique = []
+    seen = set()
+    for target in targets:
+        cleaned = " ".join(str(target).split())
+        key = normalize_for_match(cleaned)[:160]
+        if len(key) >= 8 and key not in seen:
+            seen.add(key)
+            unique.append(cleaned)
+    return unique[:30]
+
+
+def build_report_plan(source_text: str, source_filename: str | None, source_data: bytes, report_filename: str | None, report_data: bytes, report_text: str) -> dict | None:
+    if not source_text:
+        return None
+    paragraphs = []
+    if source_data and str(source_filename or "").lower().endswith(".docx"):
+        try:
+            paragraphs = [item["text"] for item in docx_paragraphs(source_data)]
+        except Exception:
+            paragraphs = []
+    if not paragraphs:
+        paragraphs = split_text_paragraphs(source_text)
+    if not paragraphs:
+        return None
+    targets = report_target_texts(report_filename, report_data, report_text)
+    indices = []
+    for idx, paragraph in enumerate(paragraphs):
+        if any(paragraph_matches_target(paragraph, target) for target in targets):
+            indices.append(idx)
+    if not indices:
+        indices = [idx for idx, paragraph in enumerate(paragraphs) if paragraph.strip()]
+    target_text = "\n\n".join(paragraphs[idx] for idx in indices if paragraphs[idx].strip())
+    return {"paragraphs": paragraphs, "indices": indices, "target_text": target_text, "target_source": "report" if targets else "full"}
+
+
+def apply_report_result(plan: dict | None, rewritten_text: str) -> list[dict]:
+    if not plan:
+        return [{"text": paragraph, "red": True} for paragraph in split_text_paragraphs(rewritten_text)]
+    paragraphs = list(plan.get("paragraphs") or [])
+    indices = list(plan.get("indices") or [])
+    rewritten_paragraphs = split_text_paragraphs(rewritten_text)
+    index_set = set(indices)
+    output = []
+    if rewritten_paragraphs and len(rewritten_paragraphs) == len(indices):
+        replacements = dict(zip(indices, rewritten_paragraphs))
+        for idx, paragraph in enumerate(paragraphs):
+            output.append({"text": replacements[idx], "red": True} if idx in replacements else {"text": paragraph, "red": False})
+        return output
+    first = indices[0] if indices else None
+    merged = "\n".join(rewritten_paragraphs) if rewritten_paragraphs else rewritten_text
+    for idx, paragraph in enumerate(paragraphs):
+        if idx == first:
+            output.append({"text": merged, "red": True})
+        elif idx in index_set:
+            continue
+        else:
+            output.append({"text": paragraph, "red": False})
+    return output
+
+
+def result_docx_base64_for(input_type: str, result: str, plan: dict | None = None) -> str:
+    if input_type == "report" and plan:
+        content = docx_from_paragraphs(apply_report_result(plan, result))
+    elif input_type in {"file", "report"}:
+        content = docx_from_text(result, red=True)
+    else:
+        return ""
+    return base64.b64encode(content).decode("ascii")
 
 def demo_rewrite(text: str, service: str) -> str:
     replacements = [
@@ -1753,11 +1950,32 @@ def optimize(payload: dict, user_id: str = DEFAULT_USER_ID) -> dict:
     input_type = str(payload.get("input_type", "text")).strip() or "text"
     source_filename = str(payload.get("source_filename", "")).strip()[:180] or None
     report_filename = str(payload.get("report_filename", "")).strip()[:180] or None
+    source_data = decode_upload_base64(str(payload.get("source_file_base64", "")))
+    report_data = decode_upload_base64(str(payload.get("report_file_base64", "")))
+
+    if input_type == "file" and source_data and source_filename:
+        text = extract_file(source_filename, source_data)["text"]
+    if input_type == "report":
+        if source_data and source_filename:
+            text = extract_file(source_filename, source_data)["text"]
+        if report_data and report_filename and not report_text:
+            report_text = extract_file(report_filename, report_data)["text"]
+
     if not text:
         raise ValueError("请输入需要处理的文本")
     if len(text) > 6000:
-        raise ValueError("演示站单次最多处理 6000 字")
-    amount_cents = service_amount_cents(service, len(text), language)
+        raise ValueError("单次最多处理 6000 字，请分批提交")
+
+    report_plan = None
+    work_text = text
+    if input_type == "report":
+        report_plan = build_report_plan(text, source_filename, source_data, report_filename, report_data, report_text)
+        if report_plan and report_plan.get("target_text"):
+            work_text = str(report_plan["target_text"]).strip()
+
+    original_chars = len(text)
+    billed_chars = len(work_text.strip()) if work_text.strip() else original_chars
+    amount_cents = service_amount_cents(service, billed_chars, language)
     order_id = uuid4().hex[:10].upper()
     created_at = int(time.time())
 
@@ -1774,44 +1992,28 @@ def optimize(payload: dict, user_id: str = DEFAULT_USER_ID) -> dict:
               engine, status, error, created_at, completed_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                order_id,
-                user_id,
-                service,
-                platform,
-                language,
-                input_type,
-                source_filename,
-                report_filename,
-                len(text),
-                amount_cents,
-                "pending",
-                "processing",
-                None,
-                created_at,
-                None,
-            ),
+            (order_id, user_id, service, platform, language, input_type, source_filename, report_filename, billed_chars, amount_cents, "pending", "processing", None, created_at, None),
         )
 
     try:
         if service == "aigc":
             try:
-                result = bypass_aigc_optimize(text, platform, language, report_text)
+                result = bypass_aigc_optimize(work_text, platform, language, report_text)
                 engine = "BypassAIGC"
-                if output_looks_broken(text, result):
+                if output_looks_broken(work_text, result):
                     raise RuntimeError("BypassAIGC returned unreadable output")
             except Exception:
                 if not has_model_api_key():
                     raise
-                result = api_rewrite(text, platform, language, report_text)
+                result = api_rewrite(work_text, platform, language, report_text)
                 engine = f"{REWRITE_MODEL} (BypassAIGC fallback)"
         elif service == "repeat":
-            result = api_rewrite(text, platform, language, report_text)
+            result = api_rewrite(work_text, platform, language, report_text)
             engine = REWRITE_MODEL
         elif service == "combo":
-            result = bypass_aigc_optimize(text, platform, language, report_text)
+            result = bypass_aigc_optimize(work_text, platform, language, report_text)
             engine = "BypassAIGC"
-            if output_looks_broken(text, result):
+            if output_looks_broken(work_text, result):
                 raise RuntimeError("BypassAIGC returned unreadable output")
         else:
             raise ValueError("该服务需要人工客服报价")
@@ -1821,8 +2023,13 @@ def optimize(payload: dict, user_id: str = DEFAULT_USER_ID) -> dict:
             with db() as conn:
                 conn.execute("UPDATE orders SET status = ?, error = ?, completed_at = ? WHERE order_id = ?", ("failed", message, int(time.time()), order_id))
             raise RuntimeError(f"BypassAIGC处理失败：{message}") from exc
-        result = demo_rewrite(text, service)
+        result = demo_rewrite(work_text, service)
         engine = "demo-fallback"
+
+    result_docx_base64 = result_docx_base64_for(input_type, result, report_plan)
+    display_result = result
+    if input_type == "report" and report_plan:
+        display_result = "\n\n".join(item["text"] for item in apply_report_result(report_plan, result) if item.get("text"))
 
     with db() as conn:
         row = conn.execute("SELECT balance_cents FROM users WHERE id = ?", (user_id,)).fetchone()
@@ -1834,22 +2041,25 @@ def optimize(payload: dict, user_id: str = DEFAULT_USER_ID) -> dict:
         conn.execute(
             """
             UPDATE orders
-            SET engine = ?, status = ?, completed_at = ?, result_text = ?
+            SET engine = ?, status = ?, completed_at = ?, result_text = ?, result_docx_base64 = ?
             WHERE order_id = ?
             """,
-            (engine, "completed", int(time.time()), result, order_id),
+            (engine, "completed", int(time.time()), display_result, result_docx_base64 or None, order_id),
         )
         conn.execute(
             "INSERT INTO ledger (user_id, type, amount_cents, balance_after_cents, ref_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (user_id, "debit", -amount_cents, balance_after, order_id, int(time.time())),
         )
 
+    extension = "docx" if input_type in {"file", "report"} else "txt"
     order = {
         "order_id": order_id,
         "service": service,
         "platform": platform,
         "language": language,
-        "chars": len(text),
+        "chars": billed_chars,
+        "original_chars": original_chars,
+        "processed_chars": billed_chars,
         "amount_cents": amount_cents,
         "amount": amount_cents / 100,
         "engine": engine,
@@ -1859,17 +2069,16 @@ def optimize(payload: dict, user_id: str = DEFAULT_USER_ID) -> dict:
         "source_filename": source_filename,
         "report_filename": report_filename,
         "download_url": f"/api/orders/{order_id}/download",
-        "output_filename": f"daisy-{service}-{order_id}.{'docx' if input_type in {'file', 'report'} else 'txt'}",
+        "output_filename": f"daisy-{service}-{order_id}.{extension}",
         "balance": user_snapshot(user_id, authenticated=user_id != DEFAULT_USER_ID)["balance"],
     }
-    return {**order, "result": result}
-
+    return {**order, "result": display_result}
 
 def recent_orders(user_id: str = DEFAULT_USER_ID, limit: int = 20) -> list[dict]:
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT order_id, service, platform, language, chars, amount_cents, engine, status, error, created_at, completed_at, result_text
+            SELECT order_id, service, platform, language, chars, amount_cents, engine, status, error, created_at, completed_at, result_text, result_docx_base64
             FROM orders
             WHERE user_id = ?
             ORDER BY created_at DESC
@@ -1877,22 +2086,25 @@ def recent_orders(user_id: str = DEFAULT_USER_ID, limit: int = 20) -> list[dict]
             """,
             (user_id, limit),
         ).fetchall()
-    return [
-        {
-            **dict(row),
-            "amount": row["amount_cents"] / 100,
-            "has_result": bool(row["result_text"]),
-            "result_preview": (row["result_text"] or "")[:90],
-        }
-        for row in rows
-    ]
-
+    orders = []
+    for row in rows:
+        item = dict(row)
+        item.pop("result_docx_base64", None)
+        item.update(
+            {
+                "amount": row["amount_cents"] / 100,
+                "has_result": bool(row["result_text"] or row["result_docx_base64"]),
+                "result_preview": (row["result_text"] or "")[:90],
+            }
+        )
+        orders.append(item)
+    return orders
 
 def order_detail(user_id: str, order_id: str) -> dict:
     with db() as conn:
         row = conn.execute(
             """
-            SELECT order_id, service, platform, language, chars, amount_cents, engine, status, error, created_at, completed_at, result_text
+            SELECT order_id, service, platform, language, chars, amount_cents, engine, status, error, created_at, completed_at, result_text, result_docx_base64
             FROM orders
             WHERE user_id = ? AND order_id = ?
             """,
@@ -1900,19 +2112,22 @@ def order_detail(user_id: str, order_id: str) -> dict:
         ).fetchone()
     if not row:
         raise ValueError("订单不存在")
-    return {
-        **dict(row),
-        "amount": row["amount_cents"] / 100,
-        "has_result": bool(row["result_text"]),
-        "result": row["result_text"] or "",
-    }
-
+    item = dict(row)
+    item.pop("result_docx_base64", None)
+    item.update(
+        {
+            "amount": row["amount_cents"] / 100,
+            "has_result": bool(row["result_text"] or row["result_docx_base64"]),
+            "result": row["result_text"] or "",
+        }
+    )
+    return item
 
 def order_result_download(user_id: str, order_id: str) -> tuple[str, bytes]:
     with db() as conn:
         row = conn.execute(
             """
-            SELECT order_id, service, input_type, source_filename, result_text
+            SELECT order_id, service, input_type, source_filename, result_text, result_docx_base64
             FROM orders
             WHERE user_id = ? AND order_id = ?
             """,
@@ -1920,25 +2135,27 @@ def order_result_download(user_id: str, order_id: str) -> tuple[str, bytes]:
         ).fetchone()
     if not row:
         raise ValueError("订单不存在")
-    if not row["result_text"]:
+    if not row["result_text"] and not row["result_docx_base64"]:
         raise ValueError("订单暂无可下载结果")
 
     if row["input_type"] in {"file", "report"}:
         stem = Path(row["source_filename"] or f"daisy-{row['service']}-{row['order_id']}").stem
-        filename = f"{stem}-降AI结果.docx"
-        content = docx_from_text(row["result_text"])
+        filename = f"{stem}-降低AIGC结果.docx"
+        if row["result_docx_base64"]:
+            content = base64.b64decode(row["result_docx_base64"])
+        else:
+            content = docx_from_text(row["result_text"] or "", red=True)
     else:
         filename = f"daisy-{row['service']}-{row['order_id']}.txt"
-        content = ("\ufeff" + row["result_text"]).encode("utf-8")
+        content = ("\ufeff" + (row["result_text"] or "")).encode("utf-8")
     return filename, content
-
 
 def delete_order_result(user_id: str, order_id: str) -> dict:
     order_id = str(order_id or "").strip().upper()
     with db() as conn:
         row = conn.execute(
             """
-            SELECT order_id, status, result_text
+            SELECT order_id, status, result_text, result_docx_base64
             FROM orders
             WHERE user_id = ? AND order_id = ?
             """,
@@ -1946,12 +2163,12 @@ def delete_order_result(user_id: str, order_id: str) -> dict:
         ).fetchone()
         if not row:
             raise ValueError("订单不存在")
-        if not row["result_text"]:
+        if not row["result_text"] and not row["result_docx_base64"]:
             raise ValueError("订单暂无可删除结果")
         conn.execute(
             """
             UPDATE orders
-            SET result_text = NULL
+            SET result_text = NULL, result_docx_base64 = NULL
             WHERE user_id = ? AND order_id = ?
             """,
             (user_id, order_id),
@@ -1963,7 +2180,6 @@ def delete_order_result(user_id: str, order_id: str) -> dict:
         "has_result": False,
     }
 
-
 def cleanup_old_order_results(retention_days: int | None = None) -> dict:
     days = RESULT_RETENTION_DAYS if retention_days is None else int(retention_days)
     if days <= 0:
@@ -1973,8 +2189,8 @@ def cleanup_old_order_results(retention_days: int | None = None) -> dict:
         cursor = conn.execute(
             """
             UPDATE orders
-            SET result_text = NULL
-            WHERE result_text IS NOT NULL
+            SET result_text = NULL, result_docx_base64 = NULL
+            WHERE (result_text IS NOT NULL OR result_docx_base64 IS NOT NULL)
               AND COALESCE(completed_at, created_at) < ?
             """,
             (cutoff,),
@@ -1987,7 +2203,6 @@ def cleanup_old_order_results(retention_days: int | None = None) -> dict:
         "cutoff": cutoff,
         "enabled": True,
     }
-
 
 def log_admin_audit(
     admin_user_id: str,
