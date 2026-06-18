@@ -399,7 +399,6 @@ class LibsqlConnection:
     def __init__(self):
         if not libsql_client:
             raise RuntimeError("libsql-client is not installed")
-        self.client = libsql_client.create_client(TURSO_CLIENT_URL, auth_token=TURSO_AUTH_TOKEN)
 
     def __enter__(self):
         return self
@@ -409,16 +408,15 @@ class LibsqlConnection:
         return False
 
     def close(self):
-        if self.client is not None:
-            run_async(self.client.close())
-            self.client = None
         return None
 
     def execute(self, sql: str, parameters=()):
         async def _execute():
-            if self.client is None:
-                raise RuntimeError("libsql connection is closed")
-            return await self.client.execute(sql, list(parameters or ()))
+            client = libsql_client.create_client(TURSO_CLIENT_URL, auth_token=TURSO_AUTH_TOKEN)
+            try:
+                return await client.execute(sql, list(parameters or ()))
+            finally:
+                await client.close()
 
         return LibsqlCursor(run_async(_execute()))
 
