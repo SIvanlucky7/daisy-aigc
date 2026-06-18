@@ -13,6 +13,7 @@ authorization that allows your commercial deployment.
 from __future__ import annotations
 
 import base64
+import copy
 import difflib
 import json
 import os
@@ -1693,6 +1694,92 @@ def docx_paragraphs(data: bytes, marked_only: bool = False) -> list[dict]:
     return paragraphs
 
 
+def paragraph_text_and_marked(para) -> tuple[str, bool]:
+    chunks = []
+    marked = False
+    for run in para.findall(f".//{{{W_NS}}}r"):
+        rpr = run.find(w_tag("rPr"))
+        marked = marked or run_is_marked(rpr)
+        for node in run:
+            if node.tag == w_tag("t"):
+                chunks.append(node.text or "")
+            elif node.tag == w_tag("tab"):
+                chunks.append("\t")
+            elif node.tag in {w_tag("br"), w_tag("cr")}:
+                chunks.append("\n")
+    return "".join(chunks).strip(), marked
+
+
+def docx_paragraph_entries(data: bytes, marked_only: bool = False) -> list[dict]:
+    with zipfile.ZipFile(BytesIO(data)) as archive:
+        xml = archive.read("word/document.xml")
+    root = ET.fromstring(xml)
+    entries = []
+    text_index = 0
+    for para_index, para in enumerate(root.findall(f".//{{{W_NS}}}p")):
+        paragraph, marked = paragraph_text_and_marked(para)
+        if paragraph:
+            if not marked_only or marked:
+                entries.append({"para_index": para_index, "text_index": text_index, "text": paragraph, "marked": marked})
+            text_index += 1
+    return entries
+
+
+def apply_red_to_rpr(rpr):
+    if rpr is None:
+        rpr = ET.Element(w_tag("rPr"))
+    for color in list(rpr.findall(w_tag("color"))):
+        rpr.remove(color)
+    color = ET.Element(w_tag("color"))
+    color.set(w_attr("val"), "FF0000")
+    rpr.append(color)
+    return rpr
+
+
+def red_replacement_run(text: str, template_rpr=None):
+    run = ET.Element(w_tag("r"))
+    rpr = apply_red_to_rpr(copy.deepcopy(template_rpr) if template_rpr is not None else None)
+    run.append(rpr)
+    for idx, piece in enumerate(str(text or "").split("\n")):
+        if idx:
+            run.append(ET.Element(w_tag("br")))
+        t = ET.Element(w_tag("t"))
+        t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        t.text = piece
+        run.append(t)
+    return run
+
+
+def replace_docx_paragraph_text(data: bytes, replacements: dict[int, str]) -> bytes:
+    if not replacements:
+        return data
+    ET.register_namespace("w", W_NS)
+    buffer = BytesIO()
+    with zipfile.ZipFile(BytesIO(data)) as source:
+        document_xml = source.read("word/document.xml")
+        root = ET.fromstring(document_xml)
+        text_index = 0
+        for para in root.findall(f".//{{{W_NS}}}p"):
+            paragraph, _marked = paragraph_text_and_marked(para)
+            if paragraph:
+                if text_index in replacements:
+                    first_run = para.find(w_tag("r"))
+                    template_rpr = first_run.find(w_tag("rPr")) if first_run is not None else None
+                    preserved = [child for child in list(para) if child.tag == w_tag("pPr")]
+                    for child in list(para):
+                        para.remove(child)
+                    for child in preserved:
+                        para.append(child)
+                    para.append(red_replacement_run(replacements[text_index], template_rpr))
+                text_index += 1
+        new_document = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as target:
+            for item in source.infolist():
+                content = new_document if item.filename == "word/document.xml" else source.read(item.filename)
+                target.writestr(item, content)
+    return buffer.getvalue()
+
+
 def extract_docx(data: bytes) -> str:
     return "\n".join(item["text"] for item in docx_paragraphs(data))
 
@@ -1736,6 +1823,25 @@ def extract_file(filename: str, data: bytes) -> dict:
         "truncated": truncated,
         "limit": MAX_EXTRACTED_CHARS,
         "text": text,
+    }
+
+
+def inspect_file(filename: str, data: bytes) -> dict:
+    if not filename:
+        raise ValueError("没有收到文件名")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError(f"文件过大，当前限制 {MAX_UPLOAD_BYTES // 1024 // 1024}MB")
+    paragraphs = document_paragraphs_for(filename, data)
+    chars = sum(len(paragraph) for paragraph in paragraphs)
+    if chars <= 0:
+        raise ValueError("没有从文件中识别到可处理文字")
+    return {
+        "filename": filename,
+        "chars": chars,
+        "paragraphs": len(paragraphs),
+        "text": "",
+        "truncated": False,
+        "limit": None,
     }
 
 
@@ -2042,6 +2148,108 @@ def api_rewrite(text: str, platform: str, language: str, report_text: str = "") 
     return result["choices"][0]["message"]["content"].strip()
 
 
+def rewrite_with_service(text: str, service: str, platform: str, language: str, report_text: str = "") -> tuple[str, str]:
+    if service == "aigc":
+        try:
+            result = bypass_aigc_optimize(text, platform, language, report_text)
+            engine = "BypassAIGC"
+            if output_looks_broken(text, result):
+                raise RuntimeError("BypassAIGC returned unreadable output")
+            return result, engine
+        except Exception:
+            if not has_model_api_key():
+                raise
+            return api_rewrite(text, platform, language, report_text), f"{REWRITE_MODEL} (BypassAIGC fallback)"
+    if service == "repeat":
+        return api_rewrite(text, platform, language, report_text), REWRITE_MODEL
+    if service == "combo":
+        result = bypass_aigc_optimize(text, platform, language, report_text)
+        if output_looks_broken(text, result):
+            raise RuntimeError("BypassAIGC returned unreadable output")
+        return result, "BypassAIGC"
+    raise ValueError("该服务需要人工客服报价")
+
+
+def optimize_paragraphs(
+    paragraphs: list[str],
+    service: str,
+    platform: str,
+    language: str,
+    report_text: str = "",
+    max_chars: int = 5200,
+) -> tuple[list[str], str]:
+    outputs: list[str] = []
+    engines: list[str] = []
+    batch: list[str] = []
+    batch_chars = 0
+
+    def flush_batch() -> None:
+        nonlocal batch, batch_chars
+        if not batch:
+            return
+        joined = "\n\n".join(batch)
+        result, engine = rewrite_with_service(joined, service, platform, language, report_text)
+        engines.append(engine)
+        rewritten = split_text_paragraphs(result)
+        if len(rewritten) == len(batch):
+            outputs.extend(rewritten)
+        elif len(batch) == 1:
+            outputs.append(result.strip())
+        else:
+            # If the upstream merged/split paragraphs, keep the content in place
+            # instead of dropping text. The first paragraph receives the merged result.
+            outputs.append(result.strip())
+            outputs.extend(batch[1:])
+        batch = []
+        batch_chars = 0
+
+    for paragraph in paragraphs:
+        paragraph = str(paragraph or "").strip()
+        if not paragraph:
+            outputs.append("")
+            continue
+        if len(paragraph) > max_chars:
+            flush_batch()
+            pieces = [paragraph[idx : idx + max_chars] for idx in range(0, len(paragraph), max_chars)]
+            rewritten_pieces: list[str] = []
+            for piece in pieces:
+                result, engine = rewrite_with_service(piece, service, platform, language, report_text)
+                engines.append(engine)
+                rewritten_pieces.append(result.strip())
+            outputs.append("".join(rewritten_pieces))
+            continue
+        if batch and batch_chars + len(paragraph) + 2 > max_chars:
+            flush_batch()
+        batch.append(paragraph)
+        batch_chars += len(paragraph) + 2
+    flush_batch()
+    unique_engines = []
+    for engine in engines:
+        if engine not in unique_engines:
+            unique_engines.append(engine)
+    return outputs, " + ".join(unique_engines) if unique_engines else "BypassAIGC"
+
+
+def document_paragraphs_for(filename: str | None, data: bytes) -> list[str]:
+    suffix = Path(str(filename or "")).suffix.lower()
+    if suffix == ".docx":
+        return [item["text"] for item in docx_paragraphs(data)]
+    if suffix == ".pdf":
+        return split_text_paragraphs(clean_extracted_text(extract_pdf(data)))
+    if suffix == ".txt":
+        return split_text_paragraphs(clean_extracted_text(extract_txt(data)))
+    raise ValueError("暂只支持 TXT、DOCX、PDF 文件")
+
+
+def build_document_docx(filename: str | None, data: bytes, replacements: dict[int, str], fallback_paragraphs: list[str]) -> bytes:
+    if data and str(filename or "").lower().endswith(".docx"):
+        return replace_docx_paragraph_text(data, replacements)
+    output = []
+    for idx, paragraph in enumerate(fallback_paragraphs):
+        output.append({"text": replacements.get(idx, paragraph), "red": idx in replacements})
+    return docx_from_paragraphs(output)
+
+
 def optimize(payload: dict, user_id: str = DEFAULT_USER_ID) -> dict:
     ensure_billing_storage_ready("扣费处理")
     text = str(payload.get("text", "")).strip()
@@ -2055,28 +2263,54 @@ def optimize(payload: dict, user_id: str = DEFAULT_USER_ID) -> dict:
     source_data = decode_upload_base64(str(payload.get("source_file_base64", "")))
     report_data = decode_upload_base64(str(payload.get("report_file_base64", "")))
 
-    if input_type == "file" and source_data and source_filename:
-        text = extract_file(source_filename, source_data)["text"]
-    if input_type == "report":
-        if source_data and source_filename:
-            text = extract_file(source_filename, source_data)["text"]
+    document_plan = None
+    if input_type == "file":
+        if not source_data or not source_filename:
+            raise ValueError("请先上传需要处理的文件")
+        document_paragraphs = document_paragraphs_for(source_filename, source_data)
+        target_indices = [idx for idx, paragraph in enumerate(document_paragraphs) if paragraph.strip()]
+        text = "\n\n".join(document_paragraphs)
+        document_plan = {"paragraphs": document_paragraphs, "indices": target_indices}
+    elif input_type == "report":
+        if not source_data or not source_filename:
+            raise ValueError("请先上传原文文件")
+        if not report_data or not report_filename:
+            raise ValueError("请先上传检测报告")
+        document_paragraphs = document_paragraphs_for(source_filename, source_data)
         if report_data and report_filename and not report_text:
-            report_text = extract_file(report_filename, report_data)["text"]
+            report_text = "\n\n".join(document_paragraphs_for(report_filename, report_data))
+        targets = report_target_texts(report_filename, report_data, report_text)
+        target_indices = []
+        for idx, paragraph in enumerate(document_paragraphs):
+            if any(paragraph_matches_target(paragraph, target) for target in targets):
+                target_indices.append(idx)
+        if not target_indices:
+            target_indices = [idx for idx, paragraph in enumerate(document_paragraphs) if paragraph.strip()]
+        text = "\n\n".join(document_paragraphs)
+        document_plan = {"paragraphs": document_paragraphs, "indices": target_indices}
 
     if not text:
         raise ValueError("请输入需要处理的文本")
-    if len(text) > 6000:
+    if input_type == "text" and len(text) > 6000:
         raise ValueError("单次最多处理 6000 字，请分批提交")
 
     report_plan = None
     work_text = text
-    if input_type == "report":
+    work_paragraphs = []
+    if document_plan:
+        work_paragraphs = [
+            str(document_plan["paragraphs"][idx]).strip()
+            for idx in document_plan["indices"]
+            if str(document_plan["paragraphs"][idx]).strip()
+        ]
+        work_text = "\n\n".join(work_paragraphs)
+    elif input_type == "report":
         report_plan = build_report_plan(text, source_filename, source_data, report_filename, report_data, report_text)
         if report_plan and report_plan.get("target_text"):
             work_text = str(report_plan["target_text"]).strip()
 
-    original_chars = len(text)
-    billed_chars = len(work_text.strip()) if work_text.strip() else original_chars
+    original_chars = sum(len(paragraph) for paragraph in document_plan["paragraphs"]) if document_plan else len(text)
+    billed_chars = sum(len(paragraph) for paragraph in work_paragraphs) if document_plan else (len(work_text.strip()) if work_text.strip() else original_chars)
     amount_cents = service_amount_cents(service, billed_chars, language)
     order_id = uuid4().hex[:10].upper()
     created_at = int(time.time())
@@ -2098,7 +2332,21 @@ def optimize(payload: dict, user_id: str = DEFAULT_USER_ID) -> dict:
         )
 
     try:
-        if service == "aigc":
+        if document_plan:
+            rewritten_paragraphs, engine = optimize_paragraphs(work_paragraphs, service, platform, language, report_text)
+            replacements = {}
+            rewrite_cursor = 0
+            for source_idx in document_plan["indices"]:
+                original_paragraph = str(document_plan["paragraphs"][source_idx]).strip()
+                if not original_paragraph:
+                    continue
+                if rewrite_cursor < len(rewritten_paragraphs):
+                    replacements[source_idx] = rewritten_paragraphs[rewrite_cursor]
+                rewrite_cursor += 1
+            result_bytes = build_document_docx(source_filename, source_data, replacements, document_plan["paragraphs"])
+            result_docx_base64 = base64.b64encode(result_bytes).decode("ascii")
+            result = "\n\n".join(replacements[idx] for idx in document_plan["indices"] if idx in replacements)
+        elif service == "aigc":
             try:
                 result = bypass_aigc_optimize(work_text, platform, language, report_text)
                 engine = "BypassAIGC"
@@ -2125,10 +2373,25 @@ def optimize(payload: dict, user_id: str = DEFAULT_USER_ID) -> dict:
             with db() as conn:
                 conn.execute("UPDATE orders SET status = ?, error = ?, completed_at = ? WHERE order_id = ?", ("failed", message, int(time.time()), order_id))
             raise RuntimeError(f"BypassAIGC处理失败：{message}") from exc
-        result = demo_rewrite(work_text, service)
+        if document_plan:
+            rewritten_paragraphs = [demo_rewrite(paragraph, service) for paragraph in work_paragraphs]
+            replacements = {}
+            rewrite_cursor = 0
+            for source_idx in document_plan["indices"]:
+                original_paragraph = str(document_plan["paragraphs"][source_idx]).strip()
+                if not original_paragraph:
+                    continue
+                replacements[source_idx] = rewritten_paragraphs[rewrite_cursor]
+                rewrite_cursor += 1
+            result_bytes = build_document_docx(source_filename, source_data, replacements, document_plan["paragraphs"])
+            result_docx_base64 = base64.b64encode(result_bytes).decode("ascii")
+            result = "\n\n".join(replacements[idx] for idx in document_plan["indices"] if idx in replacements)
+        else:
+            result = demo_rewrite(work_text, service)
         engine = "demo-fallback"
 
-    result_docx_base64 = result_docx_base64_for(input_type, result, report_plan)
+    if not document_plan:
+        result_docx_base64 = result_docx_base64_for(input_type, result, report_plan)
     display_result = result
     if input_type == "report" and report_plan:
         display_result = "\n\n".join(item["text"] for item in apply_report_result(report_plan, result) if item.get("text"))
@@ -3264,6 +3527,13 @@ class DaisyHandler(SimpleHTTPRequestHandler):
         try:
             path = urllib.parse.urlparse(self.path).path
             user_id, authenticated, session_id = self.current_session()
+            if path == "/api/inspect-file":
+                if not authenticated:
+                    self.send_json(401, {"error": "请先登录后上传文件"})
+                    return
+                filename, data = self.parse_multipart_file()
+                self.send_json(200, inspect_file(filename, data))
+                return
             if path == "/api/extract-file":
                 if not authenticated:
                     self.send_json(401, {"error": "请先登录后上传文件"})
