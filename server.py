@@ -2903,7 +2903,10 @@ class DaisyHandler(SimpleHTTPRequestHandler):
             if not is_admin_user(user_id):
                 self.send_json(403, {"error": "没有后台权限"})
                 return
-            self.send_json(200, admin_summary())
+            try:
+                self.send_json(200, admin_summary())
+            except Exception as exc:
+                self.send_json(500, {"error": str(exc), "where": "admin_summary"})
             return
         if path == "/api/admin/export":
             if not authenticated:
@@ -2915,7 +2918,7 @@ class DaisyHandler(SimpleHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             try:
                 filename, content = admin_export_csv(query.get("type", [""])[0])
-            except ValueError as exc:
+            except Exception as exc:
                 self.send_json(400, {"error": str(exc)})
                 return
             self.send_csv(filename, content)
