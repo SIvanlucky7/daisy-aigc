@@ -30,7 +30,7 @@ const LANGUAGE_RATES = {
 };
 
 const serviceDescriptions = {
-  aigc: "支持中英文文本，调用 BypassAIGC 进行表达自然化和句式调整。",
+  aigc: "支持中英文文本，进行表达自然化和句式调整。",
   repeat: "适合重复率偏高的段落。系统会重组句式、替换表达，并尽量保留术语、引用和原意边界。",
   combo: "先调用 BypassAIGC 降AI率，再进行重复表达优化。适合检测报告同时提示两类风险的文稿。",
   custom: "适合检测结果复杂、格式要求严格或交付标准明确的文稿。提交需求后由客服确认报价和时间。",
