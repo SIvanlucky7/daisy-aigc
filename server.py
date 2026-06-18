@@ -1809,24 +1809,10 @@ def optimize(payload: dict, user_id: str = DEFAULT_USER_ID) -> dict:
             result = api_rewrite(text, platform, language, report_text)
             engine = REWRITE_MODEL
         elif service == "combo":
-            try:
-                aigc_text = bypass_aigc_optimize(text, platform, language, report_text)
-                if output_looks_broken(text, aigc_text):
-                    raise RuntimeError("BypassAIGC returned unreadable output")
-                bypass_ok = True
-            except Exception:
-                if not has_model_api_key():
-                    raise
-                aigc_text = text
-                bypass_ok = False
-            result = api_rewrite(aigc_text, platform, language, report_text) if has_model_api_key() else aigc_text
-            engine = (
-                f"BypassAIGC + {REWRITE_MODEL}"
-                if bypass_ok and has_model_api_key()
-                else f"{REWRITE_MODEL} (BypassAIGC fallback)"
-                if has_model_api_key()
-                else "BypassAIGC"
-            )
+            result = bypass_aigc_optimize(text, platform, language, report_text)
+            engine = "BypassAIGC"
+            if output_looks_broken(text, result):
+                raise RuntimeError("BypassAIGC returned unreadable output")
         else:
             raise ValueError("该服务需要人工客服报价")
     except Exception as exc:
