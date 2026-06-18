@@ -11,10 +11,9 @@ function showMessage(message, type = "error") {
 }
 
 function hideMessage() {
-  if (messageBox) {
-    messageBox.hidden = true;
-    messageBox.textContent = "";
-  }
+  if (!messageBox) return;
+  messageBox.hidden = true;
+  messageBox.textContent = "";
 }
 
 function setLoading(loading, label = "") {
@@ -54,6 +53,16 @@ function redirectParam(defaultPath = "/dashboard") {
   const params = new URLSearchParams(window.location.search);
   const target = params.get("redirect") || defaultPath;
   return target.startsWith("/") ? target : defaultPath;
+}
+
+async function readApiUser(auth) {
+  try {
+    const response = await auth.apiFetch("/api/me", { cache: "no-store" });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
 }
 
 async function redirectIfLoggedIn(auth) {
@@ -175,9 +184,15 @@ async function initReset(auth) {
 async function initDashboard(auth) {
   const session = await requireSession(auth);
   if (!session) return;
-  const user = session.user;
+  const apiUser = await readApiUser(auth);
+  const user = apiUser?.authenticated ? apiUser : session.user;
   document.querySelector("[data-dashboard-email]").textContent = user.email || "-";
-  document.querySelector("[data-dashboard-id]").textContent = user.id || "-";
+  document.querySelector("[data-dashboard-id]").textContent = user.user_id || user.id || "-";
+  const isAdmin = Boolean(apiUser?.is_admin);
+  document.querySelector("[data-dashboard-role]").textContent = isAdmin ? "管理员" : "普通用户";
+  document.querySelector("[data-admin-link]").hidden = !isAdmin;
+  document.querySelector("[data-admin-nav]").hidden = !isAdmin;
+
   const logout = document.querySelector("[data-logout]");
   logout?.addEventListener("click", async () => {
     logout.disabled = true;

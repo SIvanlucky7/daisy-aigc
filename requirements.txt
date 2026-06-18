@@ -1,1 +1,1 @@
-# The current backend uses Python's standard library only.
+libsql-client==0.3.1

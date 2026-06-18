@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import asyncio
 import hashlib
 import hmac
 import secrets
@@ -26,11 +27,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from io import BytesIO, StringIO
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
+
+try:
+    import libsql_client
+except ImportError:
+    libsql_client = None
 
 
 ROOT = Path(__file__).resolve().parent
@@ -96,6 +103,8 @@ MAX_EXTRACTED_CHARS = int(os.getenv("DAISY_MAX_EXTRACTED_CHARS", "6000"))
 RESULT_RETENTION_DAYS = int(os.getenv("DAISY_RESULT_RETENTION_DAYS", "0"))
 SESSION_COOKIE = "daisy_session"
 SESSION_TTL_SECONDS = int(os.getenv("DAISY_SESSION_TTL_SECONDS", str(14 * 24 * 60 * 60)))
+COOKIE_SECURE = os.getenv("DAISY_COOKIE_SECURE", "1" if os.getenv("VERCEL") else "0") == "1"
+COOKIE_SAMESITE = os.getenv("DAISY_COOKIE_SAMESITE", "Lax").strip() or "Lax"
 PAYMENT_WEBHOOK_SECRET = os.getenv("DAISY_PAYMENT_WEBHOOK_SECRET", "dev-secret-change-me")
 API_RATE_LIMIT_PER_HOUR = int(os.getenv("DAISY_API_RATE_LIMIT_PER_HOUR", "60"))
 LOGIN_MAX_FAILED_ATTEMPTS = int(os.getenv("DAISY_LOGIN_MAX_FAILED_ATTEMPTS", "8"))
@@ -110,6 +119,15 @@ ADMIN_BOOTSTRAP_EMAIL = ADMIN_EMAIL_LIST[0] if ADMIN_EMAIL_LIST else "admin@dais
 ADMIN_BOOTSTRAP_PASSWORD = os.getenv("DAISY_ADMIN_PASSWORD", "admin123456")
 ADMIN_INITIAL_BALANCE_CENTS = int(os.getenv("DAISY_ADMIN_INITIAL_BALANCE_CENTS", "0"))
 STATELESS_SESSIONS = os.getenv("DAISY_STATELESS_SESSIONS", "0") == "1"
+ALLOW_EPHEMERAL_BILLING = os.getenv("DAISY_ALLOW_EPHEMERAL_BILLING", "0") == "1"
+TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "").strip()
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+TURSO_CLIENT_URL = (
+    f"https://{TURSO_DATABASE_URL.removeprefix('libsql://')}"
+    if TURSO_DATABASE_URL.startswith("libsql://")
+    else TURSO_DATABASE_URL
+)
+USE_TURSO = bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN)
 SUPABASE_URL = (
     os.getenv("VITE_SUPABASE_URL", "").strip()
     or os.getenv("NEXT_PUBLIC_SUPABASE_URL", "").strip()
@@ -120,6 +138,7 @@ SUPABASE_ANON_KEY = (
 )
 SUPABASE_AUTH_ENABLED = bool(SUPABASE_URL and SUPABASE_ANON_KEY)
 PUBLIC_BASE_URL = os.getenv("DAISY_PUBLIC_BASE_URL", "").strip().rstrip("/")
+REQUIRE_AUTH_FOR_BILLABLE = os.getenv("DAISY_REQUIRE_AUTH_FOR_BILLABLE", "1") != "0"
 DEFAULT_CORS_ORIGINS = "http://localhost:9910,http://127.0.0.1:9910,https://daisy-aigc.vercel.app"
 ALLOWED_CORS_ORIGINS = {
     origin.strip().rstrip("/")
@@ -194,6 +213,7 @@ ADMIN_EXPORTS = {
             "provider_trade_no",
             "user_trade_no",
             "user_payment_note",
+            "user_claimed_amount_cents",
             "notified_at",
             "cancel_note",
             "canceled_at",
@@ -202,7 +222,8 @@ ADMIN_EXPORTS = {
         ],
         "sql": """
             SELECT payment_id, user_id, amount_cents, provider, status,
-                   provider_trade_no, user_trade_no, user_payment_note, notified_at,
+                   provider_trade_no, user_trade_no, user_payment_note,
+                   user_claimed_amount_cents, notified_at,
                    cancel_note, canceled_at,
                    created_at, paid_at
             FROM payments
@@ -311,11 +332,153 @@ def http_json(method: str, url: str, payload: dict | None = None, headers: dict 
         raise RuntimeError(f"{method} {url} failed with HTTP {exc.code}: {detail[:500]}") from exc
 
 
-def db() -> sqlite3.Connection:
+def run_async(coro):
+    return asyncio.run(coro)
+
+
+class LibsqlRow(dict):
+    def __init__(self, columns, values):
+        super().__init__(zip(columns, values))
+        self._columns = list(columns)
+        self._values = list(values)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        return super().__getitem__(key)
+
+    def keys(self):
+        return self._columns
+
+
+class LibsqlCursor:
+    def __init__(self, result):
+        self.result = result
+        self.columns = [str(column) for column in getattr(result, "columns", []) or []]
+        self.rowcount = getattr(result, "rows_affected", None)
+        self.lastrowid = getattr(result, "last_insert_rowid", None)
+
+    def _row(self, row):
+        if row is None:
+            return None
+        if isinstance(row, LibsqlRow):
+            return row
+        if isinstance(row, dict):
+            columns = list(row.keys())
+            return LibsqlRow(columns, [row[column] for column in columns])
+        if hasattr(row, "asdict"):
+            values = row.asdict()
+            columns = list(values.keys())
+            return LibsqlRow(columns, [values[column] for column in columns])
+        if hasattr(row, "_mapping"):
+            values = dict(row._mapping)
+            columns = list(values.keys())
+            return LibsqlRow(columns, [values[column] for column in columns])
+        try:
+            values = dict(row)
+            columns = list(values.keys())
+            return LibsqlRow(columns, [values[column] for column in columns])
+        except (TypeError, ValueError):
+            pass
+        if self.columns:
+            return LibsqlRow(self.columns, list(row))
+        return row
+
+    def fetchone(self):
+        return self._row(self.result.rows[0]) if self.result.rows else None
+
+    def fetchall(self):
+        return [self._row(row) for row in self.result.rows]
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class LibsqlConnection:
+    def __init__(self):
+        if not libsql_client:
+            raise RuntimeError("libsql-client is not installed")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def close(self):
+        return None
+
+    def execute(self, sql: str, parameters=()):
+        async def _execute():
+            client = libsql_client.create_client(TURSO_CLIENT_URL, auth_token=TURSO_AUTH_TOKEN)
+            try:
+                return await client.execute(sql, list(parameters or ()))
+            finally:
+                await client.close()
+
+        return LibsqlCursor(run_async(_execute()))
+
+    def executescript(self, script: str):
+        for statement in (part.strip() for part in script.split(";")):
+            if statement:
+                self.execute(statement)
+        return None
+
+
+def db():
+    if USE_TURSO:
+        return LibsqlConnection()
     DB_FILE.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def database_is_ephemeral() -> bool:
+    if USE_TURSO:
+        return False
+    normalized = str(DB_FILE).replace("\\", "/")
+    return normalized.startswith("/tmp/") or (bool(os.getenv("VERCEL")) and "/tmp/" in normalized)
+
+
+def database_status() -> dict:
+    ephemeral = database_is_ephemeral()
+    engine = "turso-libsql" if USE_TURSO else "sqlite"
+    return {
+        "engine": engine,
+        "path": TURSO_DATABASE_URL if USE_TURSO else str(DB_FILE),
+        "ephemeral": ephemeral,
+        "persistent": not ephemeral,
+        "billing_allowed": (not ephemeral) or ALLOW_EPHEMERAL_BILLING,
+        "allow_ephemeral_billing": ALLOW_EPHEMERAL_BILLING,
+    }
+
+
+def ensure_billing_storage_ready(action: str = "资金操作") -> None:
+    if database_is_ephemeral() and not ALLOW_EPHEMERAL_BILLING:
+        raise ValueError(
+            f"当前后端使用临时数据库，已阻止{action}。"
+            "请先迁移到持久数据库/香港服务器；仅内部测试时可设置 DAISY_ALLOW_EPHEMERAL_BILLING=1。"
+        )
+
+
+def parse_money_cents(value, field_name: str = "金额", allow_negative: bool = False) -> int:
+    raw = str(value if value is not None else "").strip()
+    if not raw:
+        raise ValueError(f"请填写{field_name}")
+    try:
+        amount = Decimal(raw)
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"{field_name}格式不正确") from exc
+    if not amount.is_finite():
+        raise ValueError(f"{field_name}格式不正确")
+    if not allow_negative and amount <= 0:
+        raise ValueError(f"{field_name}必须大于 0")
+    cents = int((amount * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    if not allow_negative and cents <= 0:
+        raise ValueError(f"{field_name}必须大于 0")
+    return cents
 
 
 def init_db() -> None:
@@ -376,6 +539,7 @@ def init_db() -> None:
               provider_trade_no TEXT,
               user_trade_no TEXT,
               user_payment_note TEXT,
+              user_claimed_amount_cents INTEGER,
               notified_at INTEGER,
               cancel_note TEXT,
               canceled_at INTEGER,
@@ -493,6 +657,7 @@ def init_db() -> None:
         for column, ddl in {
             "user_trade_no": "ALTER TABLE payments ADD COLUMN user_trade_no TEXT",
             "user_payment_note": "ALTER TABLE payments ADD COLUMN user_payment_note TEXT",
+            "user_claimed_amount_cents": "ALTER TABLE payments ADD COLUMN user_claimed_amount_cents INTEGER",
             "notified_at": "ALTER TABLE payments ADD COLUMN notified_at INTEGER",
             "cancel_note": "ALTER TABLE payments ADD COLUMN cancel_note TEXT",
             "canceled_at": "ALTER TABLE payments ADD COLUMN canceled_at INTEGER",
@@ -936,7 +1101,21 @@ def user_snapshot(user_id: str = DEFAULT_USER_ID, authenticated: bool = False) -
             "balance": row["balance_cents"] / 100,
             "authenticated": authenticated,
             "is_demo": row["id"] == DEFAULT_USER_ID,
+            "is_admin": bool(row["email"] and row["email"].strip().lower() in ADMIN_EMAILS),
         }
+
+
+def guest_snapshot() -> dict:
+    return {
+        "user_id": None,
+        "email": "",
+        "display_name": "访客",
+        "balance_cents": 0,
+        "balance": 0,
+        "authenticated": False,
+        "is_demo": False,
+        "is_admin": False,
+    }
 
 
 def is_admin_user(user_id: str) -> bool:
@@ -1079,6 +1258,7 @@ def service_amount_cents(service: str, chars: int, language: str = "zh") -> int:
 
 
 def recharge(amount_cents: int, user_id: str = DEFAULT_USER_ID) -> dict:
+    ensure_billing_storage_ready("充值")
     if amount_cents <= 0:
         raise ValueError("充值金额必须大于 0")
     with db() as conn:
@@ -1100,6 +1280,7 @@ def payment_signature(payment_id: str, amount_cents: int, provider_trade_no: str
 
 
 def create_payment(amount_cents: int, user_id: str = DEFAULT_USER_ID, provider: str = PAYMENT_PROVIDER) -> dict:
+    ensure_billing_storage_ready("创建充值单")
     if amount_cents <= 0:
         raise ValueError("充值金额必须大于 0")
     if amount_cents > 500_000:
@@ -1149,6 +1330,7 @@ def create_payment(amount_cents: int, user_id: str = DEFAULT_USER_ID, provider: 
 
 
 def confirm_payment(payment_id: str, amount_cents: int, provider_trade_no: str, signature: str) -> dict:
+    ensure_billing_storage_ready("确认充值入账")
     expected = payment_signature(payment_id, amount_cents, provider_trade_no)
     if not secrets.compare_digest(expected, signature):
         raise ValueError("支付回调签名错误")
@@ -1185,7 +1367,8 @@ def recent_payments(user_id: str = DEFAULT_USER_ID, limit: int = 20) -> list[dic
         rows = conn.execute(
             """
             SELECT payment_id, amount_cents, provider, status, provider_trade_no,
-                   user_trade_no, user_payment_note, notified_at, cancel_note, canceled_at,
+                   user_trade_no, user_payment_note, user_claimed_amount_cents,
+                   notified_at, cancel_note, canceled_at,
                    created_at, paid_at
             FROM payments
             WHERE user_id = ?
@@ -1194,15 +1377,29 @@ def recent_payments(user_id: str = DEFAULT_USER_ID, limit: int = 20) -> list[dic
             """,
             (user_id, limit),
         ).fetchall()
-    return [{**dict(row), "amount": row["amount_cents"] / 100} for row in rows]
+    return [
+        {
+            **dict(row),
+            "amount": row["amount_cents"] / 100,
+            "user_claimed_amount": (row["user_claimed_amount_cents"] / 100) if row["user_claimed_amount_cents"] is not None else None,
+            "amount_mismatch": row["user_claimed_amount_cents"] is not None and row["user_claimed_amount_cents"] != row["amount_cents"],
+        }
+        for row in rows
+    ]
 
 
-def submit_payment_notice(user_id: str, payment_id: str, user_trade_no: str, note: str) -> dict:
+def submit_payment_notice(user_id: str, payment_id: str, user_trade_no: str, note: str, claimed_amount_cents: int | None = None) -> dict:
     payment_id = str(payment_id or "").strip().upper()
     user_trade_no = " ".join(str(user_trade_no or "").strip().split())[:80]
     note = " ".join(str(note or "").strip().split())[:160]
     if not payment_id:
         raise ValueError("缺少支付单号")
+    if claimed_amount_cents is None:
+        raise ValueError("请填写实际付款金额")
+    if claimed_amount_cents <= 0:
+        raise ValueError("实际付款金额必须大于 0")
+    if claimed_amount_cents > 500_000:
+        raise ValueError("实际付款金额过大，请联系客服处理")
     if len(user_trade_no) < 4 and len(note) < 2:
         raise ValueError("请填写付款交易号或付款备注")
 
@@ -1221,10 +1418,10 @@ def submit_payment_notice(user_id: str, payment_id: str, user_trade_no: str, not
         conn.execute(
             """
             UPDATE payments
-            SET user_trade_no = ?, user_payment_note = ?, notified_at = ?
+            SET user_trade_no = ?, user_payment_note = ?, user_claimed_amount_cents = ?, notified_at = ?
             WHERE payment_id = ? AND user_id = ?
             """,
-            (user_trade_no or None, note or None, now, payment_id, user_id),
+            (user_trade_no or None, note or None, claimed_amount_cents, now, payment_id, user_id),
         )
     return {
         "payment_id": payment_id,
@@ -1232,6 +1429,8 @@ def submit_payment_notice(user_id: str, payment_id: str, user_trade_no: str, not
         "review_status": "submitted",
         "user_trade_no": user_trade_no,
         "user_payment_note": note,
+        "user_claimed_amount_cents": claimed_amount_cents,
+        "user_claimed_amount": claimed_amount_cents / 100,
         "notified_at": now,
     }
 
@@ -1417,9 +1616,23 @@ def bypass_optimize(text: str) -> str:
     return " ".join(exported["content"].strip().split())
 
 
+def bypass_aigc_optimize(text: str, platform: str = "general", language: str = "zh", report_text: str = "") -> str:
+    return bypass_optimize(text)
+
+
 def has_model_api_key() -> bool:
     key = OPENAI_API_KEY.strip()
     return bool(key and key not in {"sk-your-key", "replace-with-model-api-key", "your-api-key-here"})
+
+
+def output_looks_broken(source: str, output: str) -> bool:
+    text = str(output or "").strip()
+    if not text:
+        return True
+    question_ratio = text.count("?") / max(1, len(text))
+    source_has_cjk = any("\u4e00" <= char <= "\u9fff" for char in source)
+    output_has_cjk = any("\u4e00" <= char <= "\u9fff" for char in text)
+    return question_ratio > 0.2 or (source_has_cjk and not output_has_cjk)
 
 
 def local_aigc_rewrite(text: str, service: str = "aigc") -> str:
@@ -1530,6 +1743,7 @@ def api_rewrite(text: str, platform: str, language: str, report_text: str = "") 
 
 
 def optimize(payload: dict, user_id: str = DEFAULT_USER_ID) -> dict:
+    ensure_billing_storage_ready("扣费处理")
     text = str(payload.get("text", "")).strip()
     report_text = str(payload.get("report_text", "")).strip()
     service = str(payload.get("service", "aigc"))
@@ -1580,15 +1794,38 @@ def optimize(payload: dict, user_id: str = DEFAULT_USER_ID) -> dict:
 
     try:
         if service == "aigc":
-            result = cloud_aigc_optimize(text, platform, language, report_text)
-            engine = f"{REWRITE_MODEL} AIGC" if has_model_api_key() else "Daisy Cloud AIGC"
+            try:
+                result = bypass_aigc_optimize(text, platform, language, report_text)
+                engine = "BypassAIGC"
+                if output_looks_broken(text, result):
+                    raise RuntimeError("BypassAIGC returned unreadable output")
+            except Exception:
+                if not has_model_api_key():
+                    raise
+                result = api_rewrite(text, platform, language, report_text)
+                engine = f"{REWRITE_MODEL} (BypassAIGC fallback)"
         elif service == "repeat":
             result = api_rewrite(text, platform, language, report_text)
             engine = REWRITE_MODEL
         elif service == "combo":
-            aigc_text = cloud_aigc_optimize(text, platform, language, report_text)
-            result = api_rewrite(aigc_text, platform, language, report_text) if has_model_api_key() else local_aigc_rewrite(aigc_text, "combo")
-            engine = f"Daisy Cloud AIGC + {REWRITE_MODEL}" if has_model_api_key() else "Daisy Cloud Combo"
+            try:
+                aigc_text = bypass_aigc_optimize(text, platform, language, report_text)
+                if output_looks_broken(text, aigc_text):
+                    raise RuntimeError("BypassAIGC returned unreadable output")
+                bypass_ok = True
+            except Exception:
+                if not has_model_api_key():
+                    raise
+                aigc_text = text
+                bypass_ok = False
+            result = api_rewrite(aigc_text, platform, language, report_text) if has_model_api_key() else aigc_text
+            engine = (
+                f"BypassAIGC + {REWRITE_MODEL}"
+                if bypass_ok and has_model_api_key()
+                else f"{REWRITE_MODEL} (BypassAIGC fallback)"
+                if has_model_api_key()
+                else "BypassAIGC"
+            )
         else:
             raise ValueError("该服务需要人工客服报价")
     except Exception as exc:
@@ -1901,6 +2138,7 @@ def admin_update_ticket(admin_user_id: str, ticket_id: str, status: str, note: s
 
 
 def admin_adjust_balance(admin_user_id: str, target_email: str, amount_cents: int, note: str, ip: str = "") -> dict:
+    ensure_billing_storage_ready("后台余额调整")
     target_email = target_email.strip().lower()
     note = " ".join(note.strip().split())
     if not is_admin_user(admin_user_id):
@@ -1994,6 +2232,9 @@ def admin_confirm_payment(admin_user_id: str, payment_id: str, provider_trade_no
         if payment["status"] != "pending":
             raise ValueError("只有待支付订单可以人工入账")
         amount_cents = int(payment["amount_cents"])
+        claimed_amount_cents = payment["user_claimed_amount_cents"]
+        if claimed_amount_cents is not None and int(claimed_amount_cents) != amount_cents:
+            raise ValueError("用户填报付款金额与支付单金额不一致，请先驳回让用户重新提交凭证")
         target_user_id = payment["user_id"]
         target = conn.execute("SELECT email FROM users WHERE id = ?", (target_user_id,)).fetchone()
         target_email = target["email"] if target else None
@@ -2185,10 +2426,14 @@ def readiness_report() -> dict:
         ),
         check(
             "database",
-            "生产数据库",
-            False,
-            "warning",
-            "当前使用 SQLite，正式多用户运营建议迁移 PostgreSQL/MySQL 并配置备份。",
+            "使用持久数据库",
+            not database_is_ephemeral(),
+            "blocker" if database_is_ephemeral() else "warning",
+            (
+                "当前数据库位于临时文件系统，Vercel Serverless 重启或换实例后可能丢失余额、订单和充值记录。正式收款前请迁移到 Supabase Postgres、Neon、Turso 或独立后端持久磁盘。"
+                if database_is_ephemeral()
+                else "当前数据库路径不是临时目录；正式运营仍建议配置自动备份和灾难恢复。"
+            ),
         ),
         check(
             "result_retention",
@@ -2248,11 +2493,14 @@ def admin_summary() -> dict:
         ).fetchall()
         payments = conn.execute(
             """
-            SELECT payment_id, user_id, amount_cents, provider, status, provider_trade_no,
-                   user_trade_no, user_payment_note, notified_at, cancel_note, canceled_at,
-                   created_at, paid_at
+            SELECT payments.payment_id, payments.user_id, payments.amount_cents, payments.provider,
+                   payments.status, payments.provider_trade_no, payments.user_trade_no,
+                   payments.user_payment_note, payments.user_claimed_amount_cents,
+                   payments.notified_at, payments.cancel_note,
+                   payments.canceled_at, payments.created_at, payments.paid_at, users.email
             FROM payments
-            ORDER BY created_at DESC
+            LEFT JOIN users ON users.id = payments.user_id
+            ORDER BY payments.created_at DESC
             LIMIT 12
             """
         ).fetchall()
@@ -2306,6 +2554,17 @@ def admin_summary() -> dict:
             item["balance"] = item["balance_cents"] / 100 if item["balance_cents"] is not None else None
         if "balance_after_cents" in item:
             item["balance_after"] = item["balance_after_cents"] / 100 if item["balance_after_cents"] is not None else None
+        if "user_claimed_amount_cents" in item:
+            item["user_claimed_amount"] = (
+                item["user_claimed_amount_cents"] / 100
+                if item["user_claimed_amount_cents"] is not None
+                else None
+            )
+        if "amount_cents" in item and "user_claimed_amount_cents" in item:
+            item["amount_mismatch"] = (
+                item["user_claimed_amount_cents"] is not None
+                and item["user_claimed_amount_cents"] != item["amount_cents"]
+            )
         return item
 
     return {
@@ -2378,6 +2637,10 @@ class DaisyHandler(SimpleHTTPRequestHandler):
 
     def end_headers(self) -> None:
         origin = self.cors_origin()
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         if origin:
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
@@ -2421,10 +2684,12 @@ class DaisyHandler(SimpleHTTPRequestHandler):
         return row["user_id"], True, session_id
 
     def session_cookie_header(self, session_id: str, max_age: int = SESSION_TTL_SECONDS) -> str:
-        return f"{SESSION_COOKIE}={session_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}"
+        secure = "; Secure" if COOKIE_SECURE else ""
+        return f"{SESSION_COOKIE}={session_id}; Path=/; HttpOnly; SameSite={COOKIE_SAMESITE}; Max-Age={max_age}{secure}"
 
     def clear_cookie_header(self) -> str:
-        return f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+        secure = "; Secure" if COOKIE_SECURE else ""
+        return f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite={COOKIE_SAMESITE}; Max-Age=0{secure}"
 
     def request_api_key(self) -> str:
         auth = self.headers.get("Authorization", "")
@@ -2524,6 +2789,8 @@ class DaisyHandler(SimpleHTTPRequestHandler):
                     "mock_payments_enabled": MOCK_PAYMENTS_ENABLED,
                     "wechat_login_enabled": False,
                     "supabase_auth_enabled": SUPABASE_AUTH_ENABLED,
+                    "billable_auth_required": REQUIRE_AUTH_FOR_BILLABLE,
+                    "database": database_status(),
                 },
             )
             return
@@ -2537,6 +2804,7 @@ class DaisyHandler(SimpleHTTPRequestHandler):
                     "demo_fallback": DEMO_FALLBACK,
                     "wechat_login_enabled": False,
                     "supabase_auth_enabled": SUPABASE_AUTH_ENABLED,
+                    "billable_auth_required": REQUIRE_AUTH_FOR_BILLABLE,
                     "supabase_url": SUPABASE_URL,
                     "supabase_anon_key": SUPABASE_ANON_KEY,
                     "max_chars": 6000,
@@ -2578,12 +2846,18 @@ class DaisyHandler(SimpleHTTPRequestHandler):
             return
         user_id, authenticated, _ = self.current_session()
         if path == "/api/me":
-            self.send_json(200, user_snapshot(user_id, authenticated=authenticated))
+            self.send_json(200, user_snapshot(user_id, authenticated=True) if authenticated else guest_snapshot())
             return
         if path == "/api/orders":
+            if not authenticated:
+                self.send_json(401, {"error": "请先登录后查看订单"})
+                return
             self.send_json(200, {"orders": recent_orders(user_id)})
             return
         if path.startswith("/api/orders/") and path.endswith("/download"):
+            if not authenticated:
+                self.send_json(401, {"error": "请先登录后下载订单结果"})
+                return
             order_id = urllib.parse.unquote(path.removeprefix("/api/orders/").removesuffix("/download")).strip("/")
             try:
                 filename, content = order_result_download(user_id, order_id)
@@ -2598,6 +2872,9 @@ class DaisyHandler(SimpleHTTPRequestHandler):
             self.send_download(filename, content, content_type)
             return
         if path.startswith("/api/orders/"):
+            if not authenticated:
+                self.send_json(401, {"error": "请先登录后查看订单"})
+                return
             order_id = urllib.parse.unquote(path.rsplit("/", 1)[-1]).strip()
             try:
                 self.send_json(200, {"order": order_detail(user_id, order_id)})
@@ -2605,6 +2882,9 @@ class DaisyHandler(SimpleHTTPRequestHandler):
                 self.send_json(404, {"error": str(exc)})
             return
         if path == "/api/payments":
+            if not authenticated:
+                self.send_json(401, {"error": "请先登录后查看充值记录"})
+                return
             self.send_json(200, {"payments": recent_payments(user_id)})
             return
         if path == "/api/support-tickets":
@@ -2655,11 +2935,14 @@ class DaisyHandler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             path = urllib.parse.urlparse(self.path).path
+            user_id, authenticated, session_id = self.current_session()
             if path == "/api/extract-file":
+                if not authenticated:
+                    self.send_json(401, {"error": "请先登录后上传文件"})
+                    return
                 filename, data = self.parse_multipart_file()
                 self.send_json(200, extract_file(filename, data))
                 return
-            user_id, authenticated, session_id = self.current_session()
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
             if path.startswith("/api/admin/"):
@@ -2670,7 +2953,7 @@ class DaisyHandler(SimpleHTTPRequestHandler):
                     self.send_json(403, {"error": "没有后台权限"})
                     return
                 if path == "/api/admin/adjust-balance":
-                    amount_cents = int(round(float(payload.get("amount", 0)) * 100))
+                    amount_cents = parse_money_cents(payload.get("amount"), "调整金额", allow_negative=True)
                     self.send_json(
                         200,
                         admin_adjust_balance(
@@ -2733,6 +3016,9 @@ class DaisyHandler(SimpleHTTPRequestHandler):
                 self.send_json(200, create_support_ticket(user_id, authenticated, payload))
                 return
             if path.startswith("/api/orders/") and path.endswith("/delete-result"):
+                if not authenticated:
+                    self.send_json(401, {"error": "请先登录后删除订单结果"})
+                    return
                 order_id = urllib.parse.unquote(path.removeprefix("/api/orders/").removesuffix("/delete-result")).strip("/")
                 self.send_json(200, delete_order_result(user_id, order_id))
                 return
@@ -2823,13 +3109,22 @@ class DaisyHandler(SimpleHTTPRequestHandler):
                         )
                         raise
                     return
+                if REQUIRE_AUTH_FOR_BILLABLE and not authenticated:
+                    self.send_json(401, {"error": "请先登录后提交订单"})
+                    return
                 self.send_json(200, optimize(payload, user_id=user_id))
                 return
             if path == "/api/payments/create":
-                amount_cents = int(float(payload.get("amount", 0)) * 100)
+                if not authenticated:
+                    self.send_json(401, {"error": "请先登录后创建充值单"})
+                    return
+                amount_cents = parse_money_cents(payload.get("amount"), "充值金额")
                 self.send_json(200, create_payment(amount_cents, user_id=user_id))
                 return
             if path == "/api/payments/notify-paid":
+                if not authenticated:
+                    self.send_json(401, {"error": "请先登录后提交付款凭证"})
+                    return
                 self.send_json(
                     200,
                     submit_payment_notice(
@@ -2837,10 +3132,14 @@ class DaisyHandler(SimpleHTTPRequestHandler):
                         str(payload.get("payment_id", "")),
                         str(payload.get("user_trade_no", "")),
                         str(payload.get("note", "")),
+                        parse_money_cents(payload.get("claimed_amount"), "实际付款金额"),
                     ),
                 )
                 return
             if path == "/api/payments/mock-confirm":
+                if not authenticated:
+                    self.send_json(401, {"error": "请先登录后确认支付"})
+                    return
                 if not MOCK_PAYMENTS_ENABLED:
                     raise ValueError("演示支付确认已关闭，请使用支付平台 webhook 确认到账")
                 self.send_json(
@@ -2865,9 +3164,12 @@ class DaisyHandler(SimpleHTTPRequestHandler):
                 )
                 return
             if path == "/api/recharge":
+                if not authenticated:
+                    self.send_json(401, {"error": "请先登录后充值"})
+                    return
                 if not MOCK_PAYMENTS_ENABLED:
                     raise ValueError("演示充值接口已关闭，请使用支付平台 webhook 入账")
-                amount_cents = int(float(payload.get("amount", 0)) * 100)
+                amount_cents = parse_money_cents(payload.get("amount"), "充值金额")
                 self.send_json(200, recharge(amount_cents, user_id=user_id))
                 return
             self.send_json(404, {"error": "Not found"})

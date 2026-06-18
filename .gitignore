@@ -9,3 +9,5 @@ vendor/
 daisy.db
 orders.jsonl
 preview-*.png
+
+.vercel

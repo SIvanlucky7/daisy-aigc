@@ -99,7 +99,7 @@
         <section class="config">
           <div class="config-heading">
             <h1 id="modeTitle">降AI率</h1>
-            <p id="modeDesc">支持中英文文本，偏向表达自然化和句式调整。遇到难降的文章，可对处理结果再次处理。</p>
+            <p id="modeDesc">支持中英文文本，调用 BypassAIGC 进行表达自然化和句式调整。</p>
           </div>
 
           <div class="controls">
@@ -186,7 +186,7 @@
               <h2>处理结果</h2>
               <button class="ghost" id="copyBtn"><i data-lucide="clipboard-copy"></i>复制</button>
             </div>
-            <textarea id="resultText" readonly placeholder="处理结果将在这里显示"></textarea>
+            <textarea id="resultText" placeholder="处理结果将在这里显示，可直接编辑、选择或删除"></textarea>
             <div class="result-empty" id="resultEmpty" hidden>
               <i data-lucide="file-text"></i>
               <strong>上传文件并点击提交开始处理</strong>
@@ -194,7 +194,7 @@
             </div>
             <div class="result-actions">
               <button id="downloadBtn"><i data-lucide="download"></i>导出 TXT</button>
-              <button id="rerunBtn"><i data-lucide="refresh-cw"></i>再次处理</button>
+              <button id="clearResultBtn" class="danger-inline"><i data-lucide="trash-2"></i>清空结果</button>
             </div>
           </article>
         </section>
@@ -387,9 +387,13 @@
             </div>
             <ul class="payment-checklist">
               <li>扫码付款时，备注请填写上方支付单号。</li>
-              <li>付款完成后，填写交易号或付款账号信息。</li>
+              <li>付款完成后，填写实际付款金额和交易号。</li>
               <li>提交审核后请勿重复创建同金额支付单。</li>
             </ul>
+            <label class="payment-proof-field">
+              <span>实际付款金额</span>
+              <input id="paymentClaimedAmount" type="number" min="0.01" max="5000" step="0.01" inputmode="decimal" placeholder="例如 50.00" />
+            </label>
             <label class="payment-proof-field">
               <span>付款交易号</span>
               <input id="paymentTradeNo" type="text" maxlength="80" placeholder="填写支付宝交易号或订单号" />
@@ -485,7 +489,7 @@
       </section>
     </div>
     <script src="/vendor/supabase.js?v=20260617"></script>
-    <script type="module" src="/supabase-auth.js?v=20260617-local-auth"></script>
-    <script src="./app.js?v=20260617-submit-auth-fix2"></script>
+    <script type="module" src="/supabase-auth.js?v=20260618-local-first"></script>
+    <script src="./app.js?v=20260618-root-pages"></script>
   </body>
 </html>

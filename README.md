@@ -2,6 +2,19 @@
 
 一个面向商业化改造的文稿自然化与降重网站骨架。
 
+## 生产状态提醒
+
+线上默认要求登录后才能创建充值单、上传文件、查看订单或调用降 AIGC；API Key 调用仍可用于正式接口接入。部署在 Vercel Serverless 时，`api/index.py` 默认使用 `/tmp/daisy.db`，这只适合演示和冒烟测试，不能承载真实余额、订单和充值数据。正式收款前必须接入持久数据库或迁到带持久磁盘的后端服务，否则重部署、冷启动或实例切换可能导致数据丢失。
+
+关键生产开关：
+
+- `DAISY_REQUIRE_AUTH_FOR_BILLABLE=1`
+- `DAISY_COOKIE_SECURE=1`
+- `DAISY_DEMO_FALLBACK=0`
+- `DAISY_ENABLE_MOCK_PAYMENT=0`
+- `DAISY_PAYMENT_PROVIDER=manual_qr` 或真实支付渠道
+- 持久化数据存储，不能使用 Vercel `/tmp/daisy.db` 保存真钱业务数据
+
 ## 已包含
 
 - 粉白色小雏菊品牌标志

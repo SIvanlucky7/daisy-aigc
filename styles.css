@@ -641,8 +641,13 @@ textarea {
 
 .dashboard-actions {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 12px;
+}
+
+.dashboard-admin-link[hidden],
+.nav [hidden] {
+  display: none;
 }
 
 @media (max-width: 760px) {

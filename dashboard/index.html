@@ -20,6 +20,7 @@
       <nav class="nav">
         <a href="/">在线处理</a>
         <a class="active" href="/dashboard">用户中心</a>
+        <a data-admin-nav href="/admin.html" hidden>后台</a>
       </nav>
     </header>
     <main class="auth-page">
@@ -40,16 +41,21 @@
               <dt>用户 ID</dt>
               <dd data-dashboard-id>读取中...</dd>
             </div>
+            <div>
+              <dt>账号权限</dt>
+              <dd data-dashboard-role>读取中...</dd>
+            </div>
           </dl>
           <div class="dashboard-actions">
             <a class="secondary-action" href="/">返回工作台</a>
+            <a class="secondary-action dashboard-admin-link" data-admin-link href="/admin.html" hidden>进入后台</a>
             <button class="auth-submit" data-logout type="button">退出登录</button>
           </div>
         </article>
       </section>
     </main>
     <script src="/vendor/supabase.js?v=20260617"></script>
-    <script type="module" src="/supabase-auth.js?v=20260617-local-auth"></script>
+    <script type="module" src="/supabase-auth.js?v=20260618-local-first"></script>
     <script type="module" src="/auth-pages.js?v=20260617-redirect-fix"></script>
   </body>
 </html>

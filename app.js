@@ -20,6 +20,7 @@ const state = {
   originalFileName: "",
   lastDownloadUrl: "",
   lastOutputFilename: "",
+  paymentPollTimer: null,
 };
 
 const UNIT_CHARS = 1000;
@@ -29,9 +30,9 @@ const LANGUAGE_RATES = {
 };
 
 const serviceDescriptions = {
-  aigc: "支持中英文文本，偏向表达自然化和句式调整。遇到难降的文章，可对处理结果再次处理。",
+  aigc: "支持中英文文本，调用 BypassAIGC 进行表达自然化和句式调整。",
   repeat: "适合重复率偏高的段落。系统会重组句式、替换表达，并尽量保留术语、引用和原意边界。",
-  combo: "先进行降AI率处理，再进行重复表达优化。适合检测报告同时提示两类风险的文稿。",
+  combo: "先调用 BypassAIGC 降AI率，再进行重复表达优化。适合检测报告同时提示两类风险的文稿。",
   custom: "适合检测结果复杂、格式要求严格或交付标准明确的文稿。提交需求后由客服确认报价和时间。",
 };
 
@@ -43,7 +44,7 @@ const submitBtn = document.querySelector("#submitBtn");
 const sampleBtn = document.querySelector("#sampleBtn");
 const copyBtn = document.querySelector("#copyBtn");
 const downloadBtn = document.querySelector("#downloadBtn");
-const rerunBtn = document.querySelector("#rerunBtn");
+const clearResultBtn = document.querySelector("#clearResultBtn");
 const dropZone = document.querySelector("#dropZone");
 const fileInput = document.querySelector("#fileInput");
 const reportUploadPanel = document.querySelector("#reportUploadPanel");
@@ -98,6 +99,7 @@ const paymentQrImage = document.querySelector("#paymentQrImage");
 const paymentReference = document.querySelector("#paymentReference");
 const paymentAccount = document.querySelector("#paymentAccount");
 const copyPaymentRefBtn = document.querySelector("#copyPaymentRefBtn");
+const paymentClaimedAmount = document.querySelector("#paymentClaimedAmount");
 const paymentTradeNo = document.querySelector("#paymentTradeNo");
 const paymentNotifyNote = document.querySelector("#paymentNotifyNote");
 const submitPaymentNoticeBtn = document.querySelector("#submitPaymentNoticeBtn");
@@ -251,7 +253,10 @@ function updatePrice() {
 
 async function refreshPublicConfig() {
   try {
-    const response = await fetch("/api/public-config");
+    const auth = await waitForDaisyAuth();
+    const response = auth?.apiFetch
+      ? await auth.apiFetch("/api/public-config")
+      : await fetch("/api/public-config");
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "配置读取失败");
     state.mockPaymentsEnabled = Boolean(payload.mock_payments_enabled);
@@ -376,6 +381,13 @@ fileInput.addEventListener("change", async () => {
 });
 
 async function extractFileToText(file, { loadingText = "", onSuccess, onError } = {}) {
+  if (!(await ensureAuthenticated())) {
+    showToast("请先登录后上传文件。");
+    openAuthModal("login");
+    onError?.(new Error("login required"));
+    updatePrice();
+    return null;
+  }
   const formData = new FormData();
   formData.append("file", file);
   if (loadingText) {
@@ -383,7 +395,7 @@ async function extractFileToText(file, { loadingText = "", onSuccess, onError } 
     updatePrice();
   }
   try {
-    const response = await fetch("/api/extract-file", {
+    const response = await authFetch("/api/extract-file", {
       method: "POST",
       body: formData,
     });
@@ -576,9 +588,14 @@ submitBtn.addEventListener("click", (event) => {
   event.stopPropagation();
   submitJob();
 });
-rerunBtn.addEventListener("click", (event) => {
+clearResultBtn.addEventListener("click", (event) => {
   event.preventDefault();
-  submitJob();
+  resultText.value = "";
+  resultText.focus();
+  state.lastDownloadUrl = "";
+  state.lastOutputFilename = "";
+  if (resultEmpty) resultEmpty.hidden = state.input !== "report";
+  showToast("处理结果已清空");
 });
 confirmOrderBtn.addEventListener("click", (event) => {
   event.preventDefault();
@@ -644,6 +661,7 @@ function resetManualPayment() {
   paymentQrImage.removeAttribute("src");
   paymentReference.textContent = "创建支付单后生成";
   paymentAccount.textContent = "请按页面提示完成付款";
+  if (paymentClaimedAmount) paymentClaimedAmount.value = "";
   paymentTradeNo.value = "";
   paymentNotifyNote.value = "";
   submitPaymentNoticeBtn.disabled = false;
@@ -666,6 +684,7 @@ function renderManualPayment(payment) {
 
   paymentReference.textContent = payment.payment_reference || payment.payment_id;
   paymentAccount.textContent = readablePaymentText(payment.payment_account, "请以扫码页显示的收款方为准");
+  if (paymentClaimedAmount) paymentClaimedAmount.value = Number(payment.amount || state.paymentAmount).toFixed(2);
   if (payment.payment_qr_url) {
     paymentQrImage.src = payment.payment_qr_url;
     paymentQrImage.hidden = false;
@@ -683,11 +702,18 @@ function paymentStatusLabelClean(payment) {
   return payment.status || "-";
 }
 
+function paymentClaimedText(payment) {
+  if (payment.user_claimed_amount == null) return "";
+  const suffix = payment.amount_mismatch ? "（与支付单不一致）" : "";
+  return ` · 填报付款 ${formatMoney(payment.user_claimed_amount)}${suffix}`;
+}
+
 function renderPaymentHistory(payments) {
   paymentHistoryList.innerHTML = payments.length
     ? payments.map((payment) => {
         const proof = payment.user_trade_no || payment.user_payment_note || "";
         const proofText = proof ? ` · 凭证 ${proof}` : "";
+        const claimedText = paymentClaimedText(payment);
         const cancelText = payment.cancel_note ? ` · 原因 ${payment.cancel_note}` : "";
         const paidText = payment.paid_at ? ` · 到账 ${formatTime(payment.paid_at)}` : "";
         const notifyText = payment.notified_at ? ` · 提交 ${formatTime(payment.notified_at)}` : "";
@@ -696,7 +722,7 @@ function renderPaymentHistory(payments) {
           <div class="payment-history-row">
             <span>
               <strong>${escapeHtml(payment.payment_id)}</strong>
-              <small>${escapeHtml(payment.provider)} · ${escapeHtml(paymentStatusLabel(payment))}${escapeHtml(proofText)}${escapeHtml(cancelText)}</small>
+              <small>${escapeHtml(payment.provider)} · ${escapeHtml(paymentStatusLabel(payment))}${escapeHtml(proofText)}${escapeHtml(claimedText)}${escapeHtml(cancelText)}</small>
               <small>${escapeHtml(formatTime(payment.created_at))}${escapeHtml(notifyText)}${escapeHtml(paidText)}${escapeHtml(canceledText)}</small>
             </span>
             <b>${escapeHtml(formatMoney(payment.amount))}</b>
@@ -706,20 +732,79 @@ function renderPaymentHistory(payments) {
     : '<div class="empty-orders">暂无充值记录</div>';
 }
 
-async function loadPaymentHistory({ quiet = false } = {}) {
-  paymentHistoryList.innerHTML = '<div class="empty-orders">正在读取充值记录...</div>';
+function stopPaymentPolling() {
+  if (state.paymentPollTimer) {
+    window.clearInterval(state.paymentPollTimer);
+    state.paymentPollTimer = null;
+  }
+}
+
+function startPaymentPolling() {
+  stopPaymentPolling();
+  state.paymentPollTimer = window.setInterval(async () => {
+    if (paymentModal.hidden || !state.pendingPayment?.payment_id) {
+      stopPaymentPolling();
+      return;
+    }
+    if (["paid", "canceled"].includes(state.pendingPayment.status)) {
+      stopPaymentPolling();
+      return;
+    }
+    await loadPaymentHistory({ quiet: true, loading: false });
+  }, 15000);
+}
+
+async function syncCurrentPaymentFromHistory(payments = []) {
+  if (!state.pendingPayment?.payment_id) return;
+  const latest = payments.find((payment) => payment.payment_id === state.pendingPayment.payment_id);
+  if (!latest) return;
+  state.pendingPayment = { ...state.pendingPayment, ...latest };
+  if (latest.status === "paid") {
+    stopPaymentPolling();
+    await refreshAccount();
+    setPaymentStage(2);
+    setPaymentBadge("已到账", "paid");
+    setPaymentText(paymentHint, `已到账 ${formatMoney(latest.amount)}，当前余额 ${formatMoney(state.balance)}。`);
+    submitPaymentNoticeBtn.disabled = true;
+    submitPaymentNoticeBtn.textContent = "已到账";
+    return;
+  }
+  if (latest.status === "canceled") {
+    stopPaymentPolling();
+    setPaymentStage(2);
+    setPaymentBadge("已驳回", "canceled");
+    setPaymentText(paymentHint, latest.cancel_note ? `付款凭证已驳回：${latest.cancel_note}` : "付款凭证已驳回，请核对后重新提交。");
+    submitPaymentNoticeBtn.disabled = true;
+    submitPaymentNoticeBtn.textContent = "已驳回";
+    return;
+  }
+  if (latest.notified_at) {
+    setPaymentStage(2);
+    setPaymentBadge("待核账", "review");
+    setPaymentText(paymentHint, "付款信息已提交，管理员核对到账后会为账户充值。");
+  }
+}
+
+async function loadPaymentHistory({ quiet = false, loading = true } = {}) {
+  if (loading) paymentHistoryList.innerHTML = '<div class="empty-orders">正在读取充值记录...</div>';
   try {
     const response = await authFetch("/api/payments");
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "充值记录读取失败");
     renderPaymentHistory(payload.payments || []);
+    await syncCurrentPaymentFromHistory(payload.payments || []);
   } catch (error) {
     paymentHistoryList.innerHTML = '<div class="empty-orders">充值记录读取失败</div>';
     if (!quiet) showToast(error.message);
   }
 }
 
-function openPaymentModal() {
+async function openPaymentModal() {
+  if (!(await ensureAuthenticated())) {
+    showToast("请先登录后再充值。");
+    openAuthModal("login");
+    return;
+  }
   state.pendingPayment = null;
   paymentOrder.textContent = "未创建";
   paymentHint.textContent = `当前选择 ¥${state.paymentAmount}`;
@@ -728,10 +813,12 @@ function openPaymentModal() {
   confirmPaymentBtn.hidden = !state.mockPaymentsEnabled;
   paymentModal.hidden = false;
   loadPaymentHistory({ quiet: true });
+  startPaymentPolling();
 }
 
 function closePaymentModal() {
   paymentModal.hidden = true;
+  stopPaymentPolling();
 }
 
 document.querySelector("#rechargeBtn").addEventListener("click", openPaymentModal);
@@ -739,7 +826,10 @@ paymentClose.addEventListener("click", closePaymentModal);
 paymentModal.addEventListener("click", (event) => {
   if (event.target === paymentModal) closePaymentModal();
 });
-refreshPaymentsBtn.addEventListener("click", () => loadPaymentHistory());
+refreshPaymentsBtn.addEventListener("click", async () => {
+  await loadPaymentHistory();
+  await refreshAccount();
+});
 
 document.querySelectorAll("[data-pay-amount]").forEach((button) => {
   button.addEventListener("click", () => {
@@ -773,6 +863,7 @@ createPaymentBtn.addEventListener("click", async () => {
       : readablePaymentText(payload.payment_message, `待支付 ¥${Number(payload.amount).toFixed(2)}，请扫码付款并提交交易号。`);
     renderManualPayment(payload);
     await loadPaymentHistory({ quiet: true });
+    startPaymentPolling();
     showToast("支付单已创建");
   } catch (error) {
     showToast(error.message);
@@ -789,6 +880,12 @@ copyPaymentRefBtn.addEventListener("click", async () => {
 submitPaymentNoticeBtn.addEventListener("click", async () => {
   if (!state.pendingPayment?.payment_id) {
     showToast("请先创建支付单");
+    return;
+  }
+  const claimedAmount = Number(paymentClaimedAmount?.value || 0);
+  if (!Number.isFinite(claimedAmount) || claimedAmount <= 0) {
+    showToast("请填写实际付款金额。");
+    paymentClaimedAmount?.focus();
     return;
   }
   const tradeNo = paymentTradeNo.value.trim();
@@ -808,14 +905,24 @@ submitPaymentNoticeBtn.addEventListener("click", async () => {
       body: JSON.stringify({
         payment_id: state.pendingPayment.payment_id,
         user_trade_no: tradeNo,
+        claimed_amount: claimedAmount,
         note,
       }),
     });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "付款信息提交失败");
+    state.pendingPayment = {
+      ...state.pendingPayment,
+      ...payload,
+      user_claimed_amount: claimedAmount,
+      amount_mismatch: Number(state.pendingPayment.amount || state.paymentAmount).toFixed(2) !== claimedAmount.toFixed(2),
+    };
     submitPaymentNoticeBtn.textContent = "已提交，等待核账";
-    paymentHint.textContent = "付款信息已提交，管理员核对到账后会为账户充值。";
+    paymentHint.textContent = state.pendingPayment.amount_mismatch
+      ? "填报金额与支付单金额不一致，管理员会核对后处理；通常需要驳回后重新提交。"
+      : "付款信息已提交，管理员核对到账后会为账户充值。";
     await loadPaymentHistory({ quiet: true });
+    startPaymentPolling();
     showToast("付款信息已提交");
   } catch (error) {
     submitPaymentNoticeBtn.disabled = false;
@@ -967,6 +1074,7 @@ renderPaymentHistory = function renderPaymentHistoryClean(payments) {
     ? payments.map((payment) => {
         const proof = payment.user_trade_no || payment.user_payment_note || "";
         const proofText = proof ? ` · 凭证 ${proof}` : "";
+        const claimedText = paymentClaimedText(payment);
         const cancelText = payment.cancel_note ? ` · 原因 ${payment.cancel_note}` : "";
         const paidText = payment.paid_at ? ` · 到账 ${formatTime(payment.paid_at)}` : "";
         const notifyText = payment.notified_at ? ` · 提交 ${formatTime(payment.notified_at)}` : "";
@@ -975,7 +1083,7 @@ renderPaymentHistory = function renderPaymentHistoryClean(payments) {
           <div class="payment-history-row">
             <span>
               <strong>${escapeHtml(payment.payment_id)}</strong>
-              <small><em class="payment-history-status ${paymentStatusClassClean(payment)}">${escapeHtml(paymentStatusLabelClean(payment))}</em>${escapeHtml(proofText)}${escapeHtml(cancelText)}</small>
+              <small><em class="payment-history-status ${paymentStatusClassClean(payment)}">${escapeHtml(paymentStatusLabelClean(payment))}</em>${escapeHtml(proofText)}${escapeHtml(claimedText)}${escapeHtml(cancelText)}</small>
               <small>${escapeHtml(formatTime(payment.created_at))}${escapeHtml(notifyText)}${escapeHtml(paidText)}${escapeHtml(canceledText)}</small>
             </span>
             <b>${escapeHtml(formatMoney(payment.amount))}</b>

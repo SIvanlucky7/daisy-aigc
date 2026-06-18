@@ -36,8 +36,12 @@ async function readJsonConfig(url) {
 }
 
 async function loadConfig() {
-  const apiConfig = await readJsonConfig("/api/public-config");
   const staticConfig = await readJsonConfig("/config.json");
+  const staticNormalized = normalizeConfig(staticConfig);
+  const publicConfigUrl = staticNormalized.apiBaseUrl
+    ? `${staticNormalized.apiBaseUrl}/api/public-config`
+    : "/api/public-config";
+  const apiConfig = await readJsonConfig(publicConfigUrl);
   return {
     ...normalizeConfig({ ...staticConfig, ...apiConfig }),
     localAuthAvailable: Object.keys(apiConfig).length > 0,
@@ -116,19 +120,19 @@ function localSessionFromUser(user) {
 }
 
 async function getSession() {
-  if (!supabase) {
-    if (!config.localAuthAvailable) return null;
-    const response = await nativeFetch(apiUrl("/api/me"), {
-      cache: "no-store",
-      credentials: config.apiBaseUrl ? "include" : "same-origin",
-    });
-    if (!response.ok) return null;
-    const user = await response.json();
-    return localSessionFromUser(user);
+  if (supabase) {
+    const { data, error } = await supabase.auth.getSession();
+    if (error) throw new Error(authErrorMessage(error));
+    if (data.session) return data.session;
   }
-  const { data, error } = await supabase.auth.getSession();
-  if (error) throw new Error(authErrorMessage(error));
-  return data.session || null;
+  if (!config.localAuthAvailable) return null;
+  const response = await nativeFetch(apiUrl("/api/me"), {
+    cache: "no-store",
+    credentials: config.apiBaseUrl ? "include" : "same-origin",
+  });
+  if (!response.ok) return null;
+  const user = await response.json();
+  return localSessionFromUser(user);
 }
 
 async function getUser() {
@@ -148,7 +152,7 @@ async function apiFetch(input, init = {}) {
   if (session?.access_token && request.isApi) {
     headers.set("Authorization", `Bearer ${session.access_token}`);
   }
-  const credentials = init.credentials || (config.apiBaseUrl && !request.sameOrigin ? "omit" : "same-origin");
+  const credentials = init.credentials || (config.apiBaseUrl && !request.sameOrigin ? "include" : "same-origin");
   return nativeFetch(request.url, { ...init, credentials, headers });
 }
 
@@ -161,7 +165,7 @@ window.fetch = async (input, init = {}) => {
 
 window.DaisyAuth = {
   configured: Boolean(supabase || config.localAuthAvailable),
-  provider: supabase ? "supabase" : config.localAuthAvailable ? "local" : "none",
+  provider: config.localAuthAvailable ? "local" : supabase ? "supabase" : "none",
   supabase,
   config,
   authErrorMessage,
@@ -169,7 +173,7 @@ window.DaisyAuth = {
   getUser,
   apiFetch,
   async signUp(email, password, redirectTo) {
-    if (!supabase) {
+    if (config.localAuthAvailable) {
       if (!config.localAuthAvailable) throw new Error("认证服务未配置，请先启用 Supabase 或本地 API");
       const response = await nativeFetch(apiUrl("/api/register"), {
         method: "POST",
@@ -185,48 +189,49 @@ window.DaisyAuth = {
         needsEmailConfirmation: false,
       };
     }
+    if (!supabase) throw new Error("Authentication service is not configured");
     const { data, error } = await supabase.auth.signUp({
       email,
       password,
       options: { emailRedirectTo: redirectTo },
     });
     if (error) throw new Error(authErrorMessage(error));
-    return { ...data, needsEmailConfirmation: true };
+    return { ...data, needsEmailConfirmation: !data.session };
   },
   async signIn(email, password) {
-    if (!supabase) {
-      if (!config.localAuthAvailable) throw new Error("认证服务未配置，请先启用 Supabase 或本地 API");
-      const response = await nativeFetch(apiUrl("/api/login"), {
+    let supabaseError = null;
+    if (supabase) {
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+      if (!error) return data;
+      supabaseError = error;
+    }
+    if (!config.localAuthAvailable) throw new Error(authErrorMessage(supabaseError || "登录失败"));
+    const response = await nativeFetch(apiUrl("/api/login"), {
+      method: "POST",
+      credentials: config.apiBaseUrl ? "include" : "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(authErrorMessage(payload.error || supabaseError || "登录失败"));
+    return {
+      user: { id: payload.user_id, email: payload.email },
+      session: localSessionFromUser(payload),
+    };
+  },
+  async signOut() {
+    if (supabase) {
+      const { error } = await supabase.auth.signOut();
+      if (error) throw new Error(authErrorMessage(error));
+    }
+    if (config.localAuthAvailable) {
+      await nativeFetch(apiUrl("/api/logout"), {
         method: "POST",
         credentials: config.apiBaseUrl ? "include" : "same-origin",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
+        body: "{}",
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(authErrorMessage(payload.error || "登录失败"));
-      return {
-        user: { id: payload.user_id, email: payload.email },
-        session: localSessionFromUser(payload),
-      };
     }
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error) throw new Error(authErrorMessage(error));
-    return data;
-  },
-  async signOut() {
-    if (!supabase) {
-      if (config.localAuthAvailable) {
-        await nativeFetch(apiUrl("/api/logout"), {
-          method: "POST",
-          credentials: config.apiBaseUrl ? "include" : "same-origin",
-          headers: { "Content-Type": "application/json" },
-          body: "{}",
-        });
-      }
-      return;
-    }
-    const { error } = await supabase.auth.signOut();
-    if (error) throw new Error(authErrorMessage(error));
   },
   async resetPassword(email, redirectTo) {
     if (!supabase) throw new Error("本地登录模式不支持邮件重置密码，请登录后在用户中心修改密码");

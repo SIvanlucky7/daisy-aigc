@@ -44,11 +44,26 @@ function attr(value) {
   return cell(value).replace(/`/g, "&#96;");
 }
 
+function claimedAmountText(row) {
+  if (row.user_claimed_amount == null) return "-";
+  const text = money(row.user_claimed_amount);
+  return row.amount_mismatch ? `${text}（不一致）` : text;
+}
+
+function paymentProofText(row) {
+  return row.user_trade_no || row.user_payment_note || row.cancel_note || "-";
+}
+
 function paymentActions(row) {
   if (row.status !== "pending") return "-";
+  const noteParts = [];
+  if (row.user_claimed_amount != null) noteParts.push(`用户填报${money(row.user_claimed_amount)}`);
+  if (row.amount_mismatch) noteParts.push("金额不一致，需驳回重填");
+  if (row.user_payment_note) noteParts.push(row.user_payment_note);
+  const defaultNote = noteParts.join("；");
   return `
-    <button class="table-action" data-confirm-payment="${attr(row.payment_id)}" data-user-trade-no="${attr(row.user_trade_no || "")}" data-user-note="${attr(row.user_payment_note || "")}">入账</button>
-    <button class="table-action danger-action" data-cancel-payment="${attr(row.payment_id)}" data-user-note="${attr(row.user_payment_note || "")}">驳回</button>
+    <button class="table-action" data-confirm-payment="${attr(row.payment_id)}" data-user-trade-no="${attr(row.user_trade_no || "")}" data-user-note="${attr(defaultNote || row.user_payment_note || "")}">入账</button>
+    <button class="table-action danger-action" data-cancel-payment="${attr(row.payment_id)}" data-user-note="${attr(defaultNote || row.user_payment_note || "")}">驳回</button>
   `;
 }
 
@@ -108,13 +123,14 @@ function renderPayments(rows) {
         <tr>
           <td>${cell(row.payment_id)}</td>
           <td>${cell(money(row.amount))}</td>
+          <td>${cell(claimedAmountText(row))}</td>
           <td>${cell(row.status)}</td>
-          <td>${cell(row.user_trade_no || row.user_payment_note || row.cancel_note || "-")}</td>
+          <td>${cell(paymentProofText(row))}</td>
           <td>${cell(row.provider_trade_no || "-")}</td>
           <td>${paymentActions(row)}</td>
         </tr>
       `).join("")
-    : '<tr><td colspan="6">暂无数据</td></tr>';
+    : '<tr><td colspan="7">暂无数据</td></tr>';
 }
 
 function renderSupportTickets(rows) {
@@ -216,6 +232,12 @@ async function loadAdmin({ quiet = false } = {}) {
 }
 
 async function initAdmin() {
+  if (!window.DaisyAuth) {
+    await new Promise((resolve) => {
+      window.addEventListener("daisy-auth-ready", resolve, { once: true });
+      setTimeout(resolve, 2500);
+    });
+  }
   try {
     const response = await fetch("/api/me");
     const payload = await response.json();
@@ -377,6 +399,25 @@ async function cleanupStoredResults() {
     cleanupResultsBtn.disabled = false;
   }
 }
+
+renderPayments = function renderPaymentsForReview(rows) {
+  const target = document.querySelector("#paymentsBody");
+  target.innerHTML = rows.length
+    ? rows.map((row) => `
+        <tr>
+          <td>${cell(row.payment_id)}</td>
+          <td>${cell(row.email || row.user_id || "-")}</td>
+          <td>${cell(money(row.amount))}</td>
+          <td>${cell(claimedAmountText(row))}</td>
+          <td>${cell(row.status)}</td>
+          <td>${cell(paymentProofText(row))}</td>
+          <td>${cell(row.notified_at ? time(row.notified_at) : "-")}</td>
+          <td>${cell(row.provider_trade_no || "-")}</td>
+          <td>${paymentActions(row)}</td>
+        </tr>
+      `).join("")
+    : '<tr><td colspan="9">暂无数据</td></tr>';
+};
 
 document.querySelector("#refreshAdmin").addEventListener("click", () => loadAdmin());
 loginForm.addEventListener("submit", loginAdmin);
