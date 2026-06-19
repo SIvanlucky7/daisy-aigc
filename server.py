@@ -1367,8 +1367,8 @@ def service_amount_cents(service: str, chars: int, language: str = "zh") -> int:
 
 def recharge(amount_cents: int, user_id: str = DEFAULT_USER_ID) -> dict:
     ensure_billing_storage_ready("充值")
-    if amount_cents <= 0:
-        raise ValueError("充值金额必须大于 0")
+    if amount_cents < 500:
+        raise ValueError("充值金额不能低于 ¥5")
     with db() as conn:
         row = conn.execute("SELECT balance_cents FROM users WHERE id = ?", (user_id,)).fetchone()
         if not row:
@@ -1389,8 +1389,8 @@ def payment_signature(payment_id: str, amount_cents: int, provider_trade_no: str
 
 def create_payment(amount_cents: int, user_id: str = DEFAULT_USER_ID, provider: str = PAYMENT_PROVIDER) -> dict:
     ensure_billing_storage_ready("创建充值单")
-    if amount_cents <= 0:
-        raise ValueError("充值金额必须大于 0")
+    if amount_cents < 500:
+        raise ValueError("充值金额不能低于 ¥5")
     if amount_cents > 500_000:
         raise ValueError("单笔充值金额过大")
     payment_id = uuid4().hex[:12].upper()
