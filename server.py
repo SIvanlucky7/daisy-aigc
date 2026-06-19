@@ -45,7 +45,7 @@ except ImportError:
 
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "2026-06-19-docx-report-1"
+APP_VERSION = "2026-06-19-progress-jobs-1"
 
 
 def load_dotenv() -> None:
@@ -629,6 +629,27 @@ def init_db() -> None:
               redirect_path TEXT NOT NULL,
               created_at INTEGER NOT NULL,
               expires_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS processing_jobs (
+              order_id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              batches_json TEXT NOT NULL,
+              replacements_json TEXT NOT NULL,
+              current_batch_json TEXT,
+              cursor INTEGER NOT NULL DEFAULT 0,
+              total INTEGER NOT NULL DEFAULT 0,
+              original_chars INTEGER NOT NULL DEFAULT 0,
+              billed_chars INTEGER NOT NULL DEFAULT 0,
+              amount_cents INTEGER NOT NULL DEFAULT 0,
+              engine TEXT,
+              status TEXT NOT NULL,
+              error TEXT,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              FOREIGN KEY(order_id) REFERENCES orders(order_id),
+              FOREIGN KEY(user_id) REFERENCES users(id)
             );
             """
         )
@@ -2250,6 +2271,370 @@ def build_document_docx(filename: str | None, data: bytes, replacements: dict[in
     return docx_from_paragraphs(output)
 
 
+def make_batches(paragraphs: list[str], source_indices: list[int], max_chars: int = 5200) -> list[dict]:
+    batches: list[dict] = []
+    current_paragraphs: list[str] = []
+    current_indices: list[int] = []
+    current_chars = 0
+
+    def flush() -> None:
+        nonlocal current_paragraphs, current_indices, current_chars
+        if current_paragraphs:
+            batches.append({"paragraphs": current_paragraphs, "source_indices": current_indices})
+        current_paragraphs = []
+        current_indices = []
+        current_chars = 0
+
+    for paragraph, source_idx in zip(paragraphs, source_indices):
+        paragraph = str(paragraph or "").strip()
+        if not paragraph:
+            continue
+        if len(paragraph) > max_chars:
+            flush()
+            pieces = [paragraph[idx : idx + max_chars] for idx in range(0, len(paragraph), max_chars)]
+            for piece_idx, piece in enumerate(pieces):
+                # Keep long paragraphs addressable. Later pieces are appended to the same source paragraph.
+                batches.append({"paragraphs": [piece], "source_indices": [source_idx], "piece_index": piece_idx})
+            continue
+        if current_paragraphs and current_chars + len(paragraph) + 2 > max_chars:
+            flush()
+        current_paragraphs.append(paragraph)
+        current_indices.append(source_idx)
+        current_chars += len(paragraph) + 2
+    flush()
+    return batches
+
+
+def build_optimize_job(payload: dict, user_id: str) -> dict:
+    ensure_billing_storage_ready("扣费处理")
+    text = str(payload.get("text", "")).strip()
+    report_text = str(payload.get("report_text", "")).strip()
+    service = str(payload.get("service", "aigc"))
+    platform = str(payload.get("platform", "general"))
+    language = str(payload.get("language", "zh"))
+    input_type = str(payload.get("input_type", "text")).strip() or "text"
+    source_filename = str(payload.get("source_filename", "")).strip()[:180] or None
+    report_filename = str(payload.get("report_filename", "")).strip()[:180] or None
+    source_data = decode_upload_base64(str(payload.get("source_file_base64", "")))
+    report_data = decode_upload_base64(str(payload.get("report_file_base64", "")))
+
+    document_plan = None
+    work_paragraphs: list[str] = []
+    source_indices: list[int] = []
+
+    if input_type == "file":
+        if not source_data or not source_filename:
+            raise ValueError("请先上传需要处理的文件")
+        document_paragraphs = document_paragraphs_for(source_filename, source_data)
+        target_indices = [idx for idx, paragraph in enumerate(document_paragraphs) if str(paragraph).strip()]
+        document_plan = {"paragraphs": document_paragraphs, "indices": target_indices}
+        work_paragraphs = [str(document_paragraphs[idx]).strip() for idx in target_indices]
+        source_indices = target_indices
+        text = "\n\n".join(document_paragraphs)
+    elif input_type == "report":
+        if not source_data or not source_filename:
+            raise ValueError("请先上传原文文件")
+        if not report_data or not report_filename:
+            raise ValueError("请先上传检测报告")
+        document_paragraphs = document_paragraphs_for(source_filename, source_data)
+        if report_data and report_filename and not report_text:
+            report_text = "\n\n".join(document_paragraphs_for(report_filename, report_data))
+        targets = report_target_texts(report_filename, report_data, report_text)
+        target_indices = []
+        for idx, paragraph in enumerate(document_paragraphs):
+            if any(paragraph_matches_target(paragraph, target) for target in targets):
+                target_indices.append(idx)
+        if not target_indices:
+            target_indices = [idx for idx, paragraph in enumerate(document_paragraphs) if str(paragraph).strip()]
+        document_plan = {"paragraphs": document_paragraphs, "indices": target_indices}
+        work_paragraphs = [str(document_paragraphs[idx]).strip() for idx in target_indices]
+        source_indices = target_indices
+        text = "\n\n".join(document_paragraphs)
+    else:
+        if not text:
+            raise ValueError("请输入需要处理的文本")
+        if len(text) > 6000:
+            raise ValueError("单次最多处理 6000 字，请分批提交")
+        work_paragraphs = split_text_paragraphs(text)
+        source_indices = list(range(len(work_paragraphs)))
+
+    if not text:
+        raise ValueError("请输入需要处理的文本")
+    if not work_paragraphs:
+        raise ValueError("没有识别到可处理的文字")
+
+    original_chars = sum(len(paragraph) for paragraph in document_plan["paragraphs"]) if document_plan else len(text)
+    billed_chars = sum(len(paragraph) for paragraph in work_paragraphs)
+    amount_cents = service_amount_cents(service, billed_chars, language)
+    order_id = uuid4().hex[:10].upper()
+    created_at = int(time.time())
+    batches = make_batches(work_paragraphs, source_indices)
+    if not batches:
+        raise ValueError("没有识别到可处理的段落")
+
+    with db() as conn:
+        row = conn.execute("SELECT balance_cents FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
+            raise ValueError("用户不存在")
+        if row["balance_cents"] < amount_cents:
+            raise ValueError("余额不足，请先充值")
+        conn.execute(
+            """
+            INSERT INTO orders (
+              order_id, user_id, service, platform, language, input_type, source_filename, report_filename, chars, amount_cents,
+              engine, status, error, created_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (order_id, user_id, service, platform, language, input_type, source_filename, report_filename, billed_chars, amount_cents, "pending", "processing", None, created_at, None),
+        )
+        conn.execute(
+            """
+            INSERT INTO processing_jobs (
+              order_id, user_id, payload_json, batches_json, replacements_json, current_batch_json, cursor, total,
+              original_chars, billed_chars, amount_cents, engine, status, error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                order_id,
+                user_id,
+                json.dumps({**payload, "report_text": report_text}, ensure_ascii=False),
+                json.dumps(batches, ensure_ascii=False),
+                "{}",
+                None,
+                0,
+                len(batches),
+                original_chars,
+                billed_chars,
+                amount_cents,
+                None,
+                "processing",
+                None,
+                created_at,
+                created_at,
+            ),
+        )
+    return optimize_job_snapshot(order_id, user_id)
+
+
+def start_bypass_session(text: str) -> dict:
+    headers = bypass_headers()
+    card_key = bypass_create_card(headers)
+    quoted = urllib.parse.quote(card_key)
+    session = http_json(
+        "POST",
+        f"{BYPASS_BASE_URL}/optimization/start?card_key={quoted}",
+        {"original_text": text, "processing_mode": "paper_enhance"},
+        timeout=30,
+    )
+    return {"card_key": card_key, "session_id": session["session_id"], "engine": "BypassAIGC"}
+
+
+def poll_bypass_session(card_key: str, session_id: str) -> dict:
+    quoted = urllib.parse.quote(card_key)
+    status = http_json("GET", f"{BYPASS_BASE_URL}/optimization/sessions/{session_id}/progress?card_key={quoted}", timeout=20)
+    if status.get("status") != "completed":
+        return {"status": status.get("status", "processing"), "raw": status}
+    exported = http_json(
+        "POST",
+        f"{BYPASS_BASE_URL}/optimization/sessions/{session_id}/export?card_key={quoted}",
+        {"session_id": session_id, "acknowledge_academic_integrity": True, "export_format": "txt"},
+        timeout=30,
+    )
+    return {"status": "completed", "content": " ".join(exported["content"].strip().split())}
+
+
+def split_rewritten_batch(result: str, originals: list[str]) -> list[str]:
+    rewritten = split_text_paragraphs(result)
+    if len(rewritten) == len(originals):
+        return rewritten
+    if len(originals) == 1:
+        return [result.strip()]
+    merged = [result.strip()]
+    merged.extend(originals[1:])
+    return merged[: len(originals)]
+
+
+def complete_current_batch(job: sqlite3.Row, batch_result: str, engine: str) -> None:
+    replacements = json.loads(job["replacements_json"] or "{}")
+    current = json.loads(job["current_batch_json"] or "{}")
+    batch = current.get("batch") or {}
+    originals = [str(item or "") for item in batch.get("paragraphs", [])]
+    source_indices = [int(idx) for idx in batch.get("source_indices", [])]
+    rewritten = split_rewritten_batch(batch_result, originals)
+    for source_idx, rewritten_text in zip(source_indices, rewritten):
+        existing = str(replacements.get(str(source_idx), ""))
+        replacements[str(source_idx)] = (existing + rewritten_text).strip() if existing else rewritten_text
+    cursor = int(job["cursor"]) + 1
+    engines = [part.strip() for part in str(job["engine"] or "").split("+") if part.strip()]
+    if engine and engine not in engines:
+        engines.append(engine)
+    now = int(time.time())
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE processing_jobs
+            SET replacements_json = ?, current_batch_json = NULL, cursor = ?, engine = ?, updated_at = ?
+            WHERE order_id = ? AND user_id = ?
+            """,
+            (json.dumps(replacements, ensure_ascii=False), cursor, " + ".join(engines), now, job["order_id"], job["user_id"]),
+        )
+
+
+def finalize_processing_job(job: sqlite3.Row) -> dict:
+    payload = json.loads(job["payload_json"] or "{}")
+    replacements_raw = json.loads(job["replacements_json"] or "{}")
+    replacements = {int(idx): str(value) for idx, value in replacements_raw.items()}
+    input_type = str(payload.get("input_type", "text") or "text")
+    source_filename = str(payload.get("source_filename", "") or "")
+    source_data = decode_upload_base64(str(payload.get("source_file_base64", "")))
+    result_docx_base64 = None
+
+    if input_type in {"file", "report"}:
+        document_paragraphs = document_paragraphs_for(source_filename, source_data)
+        result_bytes = build_document_docx(source_filename, source_data, replacements, document_paragraphs)
+        result_docx_base64 = base64.b64encode(result_bytes).decode("ascii")
+        display_result = "\n\n".join(replacements[idx] for idx in sorted(replacements))
+    else:
+        display_result = "\n\n".join(replacements[idx] for idx in sorted(replacements))
+
+    with db() as conn:
+        row = conn.execute("SELECT balance_cents FROM users WHERE id = ?", (job["user_id"],)).fetchone()
+        if not row or row["balance_cents"] < int(job["amount_cents"]):
+            conn.execute("UPDATE orders SET status = ?, error = ?, completed_at = ? WHERE order_id = ?", ("failed", "insufficient balance", int(time.time()), job["order_id"]))
+            conn.execute("UPDATE processing_jobs SET status = ?, error = ?, updated_at = ? WHERE order_id = ?", ("failed", "insufficient balance", int(time.time()), job["order_id"]))
+            raise ValueError("余额不足，请先充值")
+        balance_after = int(row["balance_cents"]) - int(job["amount_cents"])
+        now = int(time.time())
+        conn.execute("UPDATE users SET balance_cents = ? WHERE id = ?", (balance_after, job["user_id"]))
+        conn.execute(
+            """
+            UPDATE orders
+            SET engine = ?, status = ?, completed_at = ?, result_text = ?, result_docx_base64 = ?
+            WHERE order_id = ?
+            """,
+            (job["engine"] or "BypassAIGC", "completed", now, display_result, result_docx_base64, job["order_id"]),
+        )
+        conn.execute(
+            "INSERT INTO ledger (user_id, type, amount_cents, balance_after_cents, ref_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (job["user_id"], "debit", -int(job["amount_cents"]), balance_after, job["order_id"], now),
+        )
+        conn.execute("UPDATE processing_jobs SET status = ?, updated_at = ? WHERE order_id = ?", ("completed", now, job["order_id"]))
+    return optimize_job_snapshot(job["order_id"], job["user_id"])
+
+
+def optimize_job_snapshot(order_id: str, user_id: str) -> dict:
+    with db() as conn:
+        job = conn.execute("SELECT * FROM processing_jobs WHERE order_id = ? AND user_id = ?", (order_id, user_id)).fetchone()
+        if not job:
+            raise ValueError("处理任务不存在")
+        order = conn.execute("SELECT * FROM orders WHERE order_id = ? AND user_id = ?", (order_id, user_id)).fetchone()
+    payload = json.loads(job["payload_json"] or "{}")
+    extension = "docx" if str(payload.get("input_type", "text")) in {"file", "report"} else "txt"
+    percent = 100 if job["status"] == "completed" else int((int(job["cursor"]) / max(1, int(job["total"]))) * 100)
+    return {
+        "order_id": order_id,
+        "status": job["status"],
+        "progress": percent,
+        "cursor": int(job["cursor"]),
+        "total": int(job["total"]),
+        "chars": int(job["billed_chars"]),
+        "original_chars": int(job["original_chars"]),
+        "processed_chars": int(job["billed_chars"]),
+        "amount_cents": int(job["amount_cents"]),
+        "amount": int(job["amount_cents"]) / 100,
+        "engine": job["engine"] or "BypassAIGC",
+        "error": job["error"],
+        "download_url": f"/api/orders/{order_id}/download",
+        "output_filename": f"daisy-{payload.get('service', 'aigc')}-{order_id}.{extension}",
+        "result": order["result_text"] if order and order["result_text"] else "",
+        "balance": user_snapshot(user_id, authenticated=user_id != DEFAULT_USER_ID)["balance"],
+    }
+
+
+def process_optimize_job_step(order_id: str, user_id: str) -> dict:
+    with db() as conn:
+        job = conn.execute("SELECT * FROM processing_jobs WHERE order_id = ? AND user_id = ?", (order_id, user_id)).fetchone()
+    if not job:
+        raise ValueError("处理任务不存在")
+    if job["status"] == "completed":
+        return optimize_job_snapshot(order_id, user_id)
+    if job["status"] == "failed":
+        raise RuntimeError(job["error"] or "处理失败")
+    if int(job["cursor"]) >= int(job["total"]):
+        return finalize_processing_job(job)
+
+    payload = json.loads(job["payload_json"] or "{}")
+    batches = json.loads(job["batches_json"] or "[]")
+    current = json.loads(job["current_batch_json"] or "null") if job["current_batch_json"] else None
+    service = str(payload.get("service", "aigc"))
+    platform = str(payload.get("platform", "general"))
+    language = str(payload.get("language", "zh"))
+    report_text = str(payload.get("report_text", ""))
+
+    try:
+        if not current:
+            batch = batches[int(job["cursor"])]
+            joined = "\n\n".join(str(item or "") for item in batch.get("paragraphs", []))
+            if service in {"aigc", "combo"}:
+                session = start_bypass_session(joined)
+                current = {"batch": batch, **session}
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE processing_jobs SET current_batch_json = ?, updated_at = ? WHERE order_id = ? AND user_id = ?",
+                        (json.dumps(current, ensure_ascii=False), int(time.time()), order_id, user_id),
+                    )
+                snapshot = optimize_job_snapshot(order_id, user_id)
+                snapshot.update({"phase": "bypass_started", "message": "BypassAIGC 已开始处理当前批次"})
+                return snapshot
+            result, engine = rewrite_with_service(joined, service, platform, language, report_text)
+            current = {"batch": batch}
+            with db() as conn:
+                conn.execute(
+                    "UPDATE processing_jobs SET current_batch_json = ?, updated_at = ? WHERE order_id = ? AND user_id = ?",
+                    (json.dumps(current, ensure_ascii=False), int(time.time()), order_id, user_id),
+                )
+            with db() as conn:
+                job = conn.execute("SELECT * FROM processing_jobs WHERE order_id = ? AND user_id = ?", (order_id, user_id)).fetchone()
+            complete_current_batch(job, result, engine)
+        else:
+            if "session_id" in current and "card_key" in current:
+                poll = poll_bypass_session(str(current["card_key"]), str(current["session_id"]))
+                if poll.get("status") != "completed":
+                    snapshot = optimize_job_snapshot(order_id, user_id)
+                    snapshot.update({"phase": "bypass_processing", "message": "BypassAIGC 正在处理当前批次"})
+                    return snapshot
+                complete_current_batch(job, str(poll.get("content", "")), "BypassAIGC")
+            else:
+                # A previous synchronous batch finished but was not advanced; continue safely.
+                complete_current_batch(job, "\n\n".join(current.get("batch", {}).get("paragraphs", [])), job["engine"] or "BypassAIGC")
+    except Exception as exc:
+        if not DEMO_FALLBACK:
+            with db() as conn:
+                conn.execute("UPDATE orders SET status = ?, error = ?, completed_at = ? WHERE order_id = ?", ("failed", str(exc)[:500], int(time.time()), order_id))
+                conn.execute("UPDATE processing_jobs SET status = ?, error = ?, updated_at = ? WHERE order_id = ?", ("failed", str(exc)[:500], int(time.time()), order_id))
+            raise
+        fallback_job = job
+        if not current:
+            batch = batches[int(job["cursor"])]
+            current = {"batch": batch}
+            with db() as conn:
+                conn.execute(
+                    "UPDATE processing_jobs SET current_batch_json = ?, updated_at = ? WHERE order_id = ? AND user_id = ?",
+                    (json.dumps(current, ensure_ascii=False), int(time.time()), order_id, user_id),
+                )
+                fallback_job = conn.execute("SELECT * FROM processing_jobs WHERE order_id = ? AND user_id = ?", (order_id, user_id)).fetchone()
+        result = "\n\n".join(demo_rewrite(paragraph, service) for paragraph in current.get("batch", {}).get("paragraphs", []))
+        complete_current_batch(fallback_job, result, "demo-fallback")
+
+    with db() as conn:
+        refreshed = conn.execute("SELECT * FROM processing_jobs WHERE order_id = ? AND user_id = ?", (order_id, user_id)).fetchone()
+    if int(refreshed["cursor"]) >= int(refreshed["total"]):
+        return finalize_processing_job(refreshed)
+    snapshot = optimize_job_snapshot(order_id, user_id)
+    snapshot.update({"phase": "batch_completed", "message": "当前批次已完成，继续处理下一批"})
+    return snapshot
+
+
 def optimize(payload: dict, user_id: str = DEFAULT_USER_ID) -> dict:
     ensure_billing_storage_ready("扣费处理")
     text = str(payload.get("text", "")).strip()
@@ -3665,6 +4050,18 @@ class DaisyHandler(SimpleHTTPRequestHandler):
                     self.send_json(401, {"error": "请先登录后撤销 API Key"})
                     return
                 self.send_json(200, revoke_api_key(user_id, str(payload.get("id", ""))))
+                return
+            if path == "/api/optimize/start":
+                if REQUIRE_AUTH_FOR_BILLABLE and not authenticated:
+                    self.send_json(401, {"error": "请先登录后提交订单"})
+                    return
+                self.send_json(200, build_optimize_job(payload, user_id=user_id))
+                return
+            if path == "/api/optimize/step":
+                if REQUIRE_AUTH_FOR_BILLABLE and not authenticated:
+                    self.send_json(401, {"error": "请先登录后处理订单"})
+                    return
+                self.send_json(200, process_optimize_job_step(str(payload.get("order_id", "")), user_id=user_id))
                 return
             if path == "/api/optimize":
                 api_key = self.request_api_key()

@@ -93,6 +93,14 @@ const orderConfirmClose = document.querySelector("#orderConfirmClose");
 const orderCancelBtn = document.querySelector("#orderCancelBtn");
 const orderConfirmSummary = document.querySelector("#orderConfirmSummary");
 const confirmOrderBtn = document.querySelector("#confirmOrderBtn");
+const orderProgress = document.querySelector("#orderProgress");
+const orderProgressTitle = document.querySelector("#orderProgressTitle");
+const orderProgressPercent = document.querySelector("#orderProgressPercent");
+const orderProgressBar = document.querySelector("#orderProgressBar");
+const orderProgressDetail = document.querySelector("#orderProgressDetail");
+const progressStepUpload = document.querySelector("#progressStepUpload");
+const progressStepProcess = document.querySelector("#progressStepProcess");
+const progressStepExport = document.querySelector("#progressStepExport");
 const createPaymentBtn = document.querySelector("#createPaymentBtn");
 const confirmPaymentBtn = document.querySelector("#confirmPaymentBtn");
 const paymentOrder = document.querySelector("#paymentOrder");
@@ -589,6 +597,73 @@ function closeOrderConfirmModal() {
   orderConfirmModal.hidden = true;
   state.pendingJob = null;
   confirmOrderBtn.disabled = false;
+  resetOrderProgress();
+}
+
+function setOrderProgress({ percent = 0, title = "", detail = "", active = 0, error = false } = {}) {
+  if (!orderProgress) return;
+  const value = Math.max(0, Math.min(100, Math.round(percent)));
+  orderProgress.hidden = false;
+  orderProgress.classList.toggle("error", Boolean(error));
+  if (orderProgressTitle) orderProgressTitle.textContent = title || "处理中";
+  if (orderProgressPercent) orderProgressPercent.textContent = `${value}%`;
+  if (orderProgressBar) orderProgressBar.style.width = `${value}%`;
+  if (orderProgressDetail) orderProgressDetail.textContent = detail || "";
+  [progressStepUpload, progressStepProcess, progressStepExport].forEach((step, index) => {
+    if (!step) return;
+    step.classList.toggle("done", index < active);
+    step.classList.toggle("active", index === active && !error);
+  });
+}
+
+function resetOrderProgress() {
+  if (!orderProgress) return;
+  orderProgress.hidden = true;
+  orderProgress.classList.remove("error");
+  if (orderProgressBar) orderProgressBar.style.width = "0%";
+  if (orderProgressPercent) orderProgressPercent.textContent = "0%";
+  [progressStepUpload, progressStepProcess, progressStepExport].forEach((step) => {
+    if (!step) return;
+    step.classList.remove("active", "done");
+  });
+}
+
+function friendlyFetchError(error) {
+  const message = String(error?.message || error || "");
+  if (message.includes("Failed to fetch") || message.includes("NetworkError") || message.includes("Load failed")) {
+    return "网络请求中断或处理超时。请刷新订单中心查看是否已生成结果；如果没有生成订单，请稍后重试。";
+  }
+  return message || "处理失败，请稍后重试。";
+}
+
+function optimizePayload(job) {
+  return {
+    service: job.service,
+    platform: job.platform,
+    language: job.language,
+    input_type: job.inputType,
+    source_filename: job.sourceFilename,
+    report_filename: job.reportFilename,
+    report_text: job.reportText,
+    source_file_base64: job.sourceFileBase64,
+    report_file_base64: job.reportFileBase64,
+    text: job.text,
+  };
+}
+
+function wait(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function postJson(url, body) {
+  const response = await authFetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || "处理失败");
+  return payload;
 }
 
 async function submitJob() {
@@ -624,6 +699,7 @@ async function runOptimize(job) {
   const price = job.amount;
   submitBtn.disabled = true;
   confirmOrderBtn.disabled = true;
+  confirmOrderBtn.textContent = "处理中...";
   submitBtn.innerHTML = '<i data-lucide="loader-2"></i>处理中';
   resultText.value = "";
   state.lastDownloadUrl = "";
@@ -632,27 +708,37 @@ async function runOptimize(job) {
   createIconsSafe();
 
   try {
+    setOrderProgress({
+      percent: 8,
+      title: "正在创建订单",
+      detail: "正在校验余额、文件和计费字数。",
+      active: 0,
+    });
     setStep(1);
     resultText.hidden = job.inputType !== "text";
     if (resultEmpty) resultEmpty.hidden = true;
-    const response = await authFetch("/api/optimize", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        service: job.service,
-        platform: job.platform,
-        language: job.language,
-        input_type: job.inputType,
-        source_filename: job.sourceFilename,
-        report_filename: job.reportFilename,
-        report_text: job.reportText,
-        source_file_base64: job.sourceFileBase64,
-        report_file_base64: job.reportFileBase64,
-        text: job.text,
-      }),
+    let payload = await postJson("/api/optimize/start", optimizePayload(job));
+    let loops = 0;
+    while (payload.status !== "completed") {
+      loops += 1;
+      const progress = Math.max(10, Math.min(92, Number(payload.progress || 0)));
+      const total = Math.max(1, Number(payload.total || 1));
+      const cursor = Math.min(total, Number(payload.cursor || 0));
+      setOrderProgress({
+        percent: progress,
+        title: payload.phase === "bypass_started" || payload.phase === "bypass_processing" ? "BypassAIGC 处理中" : "正在处理文档",
+        detail: `已完成 ${cursor}/${total} 批。${payload.message || "系统正在分批降低 AIGC 率，请不要关闭页面。"}`,
+        active: cursor <= 0 ? 1 : 1,
+      });
+      await wait(payload.phase === "bypass_processing" ? 3000 : 1200);
+      payload = await postJson("/api/optimize/step", { order_id: payload.order_id });
+    }
+    setOrderProgress({
+      percent: 96,
+      title: "正在生成结果",
+      detail: job.inputType === "text" ? "正在写入订单并刷新余额。" : "正在生成 Word 文件、标红改动内容并刷新余额。",
+      active: 2,
     });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "处理失败");
     setStep(2);
     if (job.inputType === "text") {
       resultText.value = payload.result;
@@ -675,12 +761,22 @@ async function runOptimize(job) {
     state.balance = Number(payload.balance ?? Math.max(0, state.balance - price));
     closeOrderConfirmModal();
     updatePrice();
+    setOrderProgress({ percent: 100, title: "处理完成", detail: "结果已生成。", active: 3 });
     showToast(`订单 ${payload.order_id} 已完成，扣费 ¥${Number(payload.amount || price).toFixed(2)}`);
   } catch (error) {
-    showToast(error.message);
+    const message = friendlyFetchError(error);
+    setOrderProgress({
+      percent: 100,
+      title: "处理失败",
+      detail: message,
+      active: 1,
+      error: true,
+    });
+    showToast(message);
   } finally {
     submitBtn.innerHTML = '<i data-lucide="arrow-right"></i>提交';
     confirmOrderBtn.disabled = false;
+    confirmOrderBtn.textContent = "确认并处理";
     createIconsSafe();
     updatePrice();
   }
@@ -740,7 +836,7 @@ async function downloadBlob(url, fallbackName) {
 }
 
 downloadBtn.addEventListener("click", async () => {
-  if (!resultText.value) return;
+  if (!resultText.value && !state.lastDownloadUrl) return;
   try {
     if (state.lastDownloadUrl) {
       await downloadBlob(state.lastDownloadUrl, state.lastOutputFilename || `雏菊论文-${Date.now()}.docx`);
