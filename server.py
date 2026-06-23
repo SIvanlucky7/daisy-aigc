@@ -18,10 +18,10 @@ import difflib
 import json
 import os
 import re
-import asyncio
 import hashlib
 import hmac
 import secrets
+import socket
 import sqlite3
 import time
 import zipfile
@@ -38,14 +38,8 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
 
-try:
-    import libsql_client
-except ImportError:
-    libsql_client = None
-
-
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "2026-06-19-progress-jobs-1"
+APP_VERSION = "2026-06-24-bypass-retry-1"
 
 
 def load_dotenv() -> None:
@@ -146,10 +140,10 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 SUPABASE_ADMIN_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 PUBLIC_BASE_URL = os.getenv("DAISY_PUBLIC_BASE_URL", "").strip().rstrip("/")
 REQUIRE_AUTH_FOR_BILLABLE = os.getenv("DAISY_REQUIRE_AUTH_FOR_BILLABLE", "1") != "0"
-DEFAULT_CORS_ORIGINS = "http://localhost:9910,http://127.0.0.1:9910,https://daisy-aigc.vercel.app,https://sivanlucky7.github.io"
+DEFAULT_CORS_ORIGINS = "http://localhost:9910,http://127.0.0.1:9910,https://daisy-aigc.vercel.app,https://sivanlucky7.github.io,https://daisy-aigc-api-proxy.western-pantydraco.workers.dev,https://daisy-aigc-api-proxy.billowy-waste.workers.dev"
 ALLOWED_CORS_ORIGINS = {
     origin.strip().rstrip("/")
-    for origin in os.getenv("DAISY_ALLOWED_ORIGINS", DEFAULT_CORS_ORIGINS).split(",")
+    for origin in f"{DEFAULT_CORS_ORIGINS},{os.getenv('DAISY_ALLOWED_ORIGINS', '')}".split(",")
     if origin.strip()
 }
 WECHAT_APP_ID = os.getenv("WECHAT_APP_ID", "").strip()
@@ -339,8 +333,18 @@ def http_json(method: str, url: str, payload: dict | None = None, headers: dict 
         raise RuntimeError(f"{method} {url} failed with HTTP {exc.code}: {detail[:500]}") from exc
 
 
-def run_async(coro):
-    return asyncio.run(coro)
+def is_transient_upstream_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return isinstance(exc, (TimeoutError, socket.timeout, urllib.error.URLError)) or any(
+        marker in message
+        for marker in (
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "connection reset",
+            "remote end closed",
+        )
+    )
 
 
 class LibsqlRow(dict):
@@ -401,10 +405,105 @@ class LibsqlCursor:
         return iter(self.fetchall())
 
 
+class LibsqlHttpResult:
+    def __init__(self, columns=None, rows=None, rows_affected=None, last_insert_rowid=None):
+        self.columns = columns or []
+        self.rows = rows or []
+        self.rows_affected = rows_affected
+        self.last_insert_rowid = last_insert_rowid
+
+
+def libsql_encode_value(value):
+    if value is None:
+        return {"type": "null"}
+    if isinstance(value, bool):
+        return {"type": "integer", "value": "1" if value else "0"}
+    if isinstance(value, int):
+        return {"type": "integer", "value": str(value)}
+    if isinstance(value, float):
+        return {"type": "float", "value": value}
+    if isinstance(value, (bytes, bytearray)):
+        return {"type": "blob", "base64": base64.b64encode(bytes(value)).decode("ascii")}
+    return {"type": "text", "value": str(value)}
+
+
+def libsql_decode_value(item):
+    if item is None:
+        return None
+    if not isinstance(item, dict):
+        return item
+    value_type = item.get("type")
+    if value_type == "null":
+        return None
+    if value_type == "integer":
+        raw = item.get("value")
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return raw
+    if value_type == "float":
+        return item.get("value")
+    if value_type == "blob":
+        raw = item.get("base64") or item.get("value") or ""
+        try:
+            return base64.b64decode(raw)
+        except (ValueError, TypeError):
+            return raw
+    return item.get("value")
+
+
+def libsql_http_execute(sql: str, parameters=()):
+    if not TURSO_CLIENT_URL or not TURSO_AUTH_TOKEN:
+        raise RuntimeError("Turso database is not configured")
+    payload = {
+        "requests": [
+            {
+                "type": "execute",
+                "stmt": {
+                    "sql": sql,
+                    "args": [libsql_encode_value(value) for value in (parameters or ())],
+                },
+            }
+        ]
+    }
+    url = f"{TURSO_CLIENT_URL.rstrip('/')}/v2/pipeline"
+    response = http_json(
+        "POST",
+        url,
+        payload,
+        headers={"Authorization": f"Bearer {TURSO_AUTH_TOKEN}"},
+        timeout=30,
+    )
+    results = (response or {}).get("results") or []
+    if not results:
+        return LibsqlHttpResult()
+    first = results[0]
+    if first.get("type") == "error":
+        error = first.get("error") or {}
+        raise RuntimeError(error.get("message") or str(error) or "Turso execute failed")
+    result = (((first.get("response") or {}).get("result")) or {})
+    columns = [str(column.get("name") or "") for column in (result.get("cols") or [])]
+    rows = [
+        [libsql_decode_value(value) for value in row]
+        for row in (result.get("rows") or [])
+    ]
+    last_insert_rowid = result.get("last_insert_rowid")
+    try:
+        last_insert_rowid = int(last_insert_rowid) if last_insert_rowid is not None else None
+    except (TypeError, ValueError):
+        pass
+    return LibsqlHttpResult(
+        columns=columns,
+        rows=rows,
+        rows_affected=result.get("affected_row_count"),
+        last_insert_rowid=last_insert_rowid,
+    )
+
+
 class LibsqlConnection:
     def __init__(self):
-        if not libsql_client:
-            raise RuntimeError("libsql-client is not installed")
+        if not TURSO_CLIENT_URL or not TURSO_AUTH_TOKEN:
+            raise RuntimeError("Turso database is not configured")
 
     def __enter__(self):
         return self
@@ -417,14 +516,7 @@ class LibsqlConnection:
         return None
 
     def execute(self, sql: str, parameters=()):
-        async def _execute():
-            client = libsql_client.create_client(TURSO_CLIENT_URL, auth_token=TURSO_AUTH_TOKEN)
-            try:
-                return await client.execute(sql, list(parameters or ()))
-            finally:
-                await client.close()
-
-        return LibsqlCursor(run_async(_execute()))
+        return LibsqlCursor(libsql_http_execute(sql, parameters))
 
     def executescript(self, script: str):
         for statement in (part.strip() for part in script.split(";")):
@@ -2551,6 +2643,23 @@ def optimize_job_snapshot(order_id: str, user_id: str) -> dict:
     }
 
 
+def processing_debug() -> dict:
+    init_db()
+    with db() as conn:
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = ? AND name = ?",
+            ("table", "processing_jobs"),
+        ).fetchone()
+        count = conn.execute("SELECT COUNT(*) AS count FROM processing_jobs").fetchone()
+    return {
+        "ok": True,
+        "app_version": APP_VERSION,
+        "database": database_status(),
+        "processing_jobs_table": bool(table),
+        "processing_jobs_count": int(count["count"] if count else 0),
+    }
+
+
 def process_optimize_job_step(order_id: str, user_id: str) -> dict:
     with db() as conn:
         job = conn.execute("SELECT * FROM processing_jobs WHERE order_id = ? AND user_id = ?", (order_id, user_id)).fetchone()
@@ -2608,6 +2717,21 @@ def process_optimize_job_step(order_id: str, user_id: str) -> dict:
                 # A previous synchronous batch finished but was not advanced; continue safely.
                 complete_current_batch(job, "\n\n".join(current.get("batch", {}).get("paragraphs", [])), job["engine"] or "BypassAIGC")
     except Exception as exc:
+        if not DEMO_FALLBACK and is_transient_upstream_error(exc):
+            with db() as conn:
+                conn.execute(
+                    "UPDATE processing_jobs SET error = ?, updated_at = ? WHERE order_id = ? AND user_id = ?",
+                    (str(exc)[:500], int(time.time()), order_id, user_id),
+                )
+            snapshot = optimize_job_snapshot(order_id, user_id)
+            snapshot.update(
+                {
+                    "phase": "bypass_retry",
+                    "message": "BypassAIGC is warming up or responding slowly; retrying automatically",
+                    "transient_error": str(exc)[:200],
+                }
+            )
+            return snapshot
         if not DEMO_FALLBACK:
             with db() as conn:
                 conn.execute("UPDATE orders SET status = ?, error = ?, completed_at = ? WHERE order_id = ?", ("failed", str(exc)[:500], int(time.time()), order_id))
@@ -3728,9 +3852,17 @@ class DaisyHandler(SimpleHTTPRequestHandler):
         body = self.rfile.read(length)
         marker = b"--" + boundary
         for part in body.split(marker):
-            if b"Content-Disposition:" not in part or b'name="file"' not in part:
+            lower_part = part.lower()
+            has_file_field = (
+                b'name="file"' in lower_part
+                or b"name='file'" in lower_part
+                or b"name=file" in lower_part
+            )
+            if b"content-disposition:" not in lower_part or not has_file_field:
                 continue
-            header, _, file_data = part.partition(b"\r\n\r\n")
+            header, separator, file_data = part.partition(b"\r\n\r\n")
+            if not separator:
+                header, separator, file_data = part.partition(b"\n\n")
             if not file_data:
                 continue
             if file_data.endswith(b"\r\n"):
@@ -3762,6 +3894,8 @@ class DaisyHandler(SimpleHTTPRequestHandler):
                     "billable_auth_required": REQUIRE_AUTH_FOR_BILLABLE,
                     "database": database_status(),
                     "app_version": APP_VERSION,
+                    "cors_allows_pages": "https://sivanlucky7.github.io" in ALLOWED_CORS_ORIGINS,
+                    "cors_origin_count": len(ALLOWED_CORS_ORIGINS),
                     "commit": os.getenv("VERCEL_GIT_COMMIT_SHA", ""),
                 },
             )
@@ -3784,6 +3918,9 @@ class DaisyHandler(SimpleHTTPRequestHandler):
                     "max_upload_bytes": MAX_UPLOAD_BYTES,
                 },
             )
+            return
+        if path == "/api/debug/processing":
+            self.send_json(200, processing_debug())
             return
         if path == "/api/wechat/login":
             query = urllib.parse.parse_qs(parsed.query)
@@ -3913,16 +4050,10 @@ class DaisyHandler(SimpleHTTPRequestHandler):
             path = urllib.parse.urlparse(self.path).path
             user_id, authenticated, session_id = self.current_session()
             if path == "/api/inspect-file":
-                if not authenticated:
-                    self.send_json(401, {"error": "请先登录后上传文件"})
-                    return
                 filename, data = self.parse_multipart_file()
                 self.send_json(200, inspect_file(filename, data))
                 return
             if path == "/api/extract-file":
-                if not authenticated:
-                    self.send_json(401, {"error": "请先登录后上传文件"})
-                    return
                 filename, data = self.parse_multipart_file()
                 self.send_json(200, extract_file(filename, data))
                 return

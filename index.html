@@ -1,12 +1,12 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>雏菊论文 - AIGC与降重处理工具</title>
     <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="./styles.css?v=20260619-pages-prod" />
-    <script src="./icons.js?v=20260619-pages-prod"></script>
+    <link rel="stylesheet" href="./styles.css?v=20260624-step-text-1" />
+    <script src="./icons.js?v=20260624-step-text-1"></script>
   </head>
   <body>
     <header class="topbar">
@@ -137,7 +137,8 @@
             </div>
             <div class="drop-zone" id="dropZone">
               <i data-lucide="upload-cloud"></i>
-              <span>拖拽文件到这里，或选择 TXT/DOCX/PDF</span>
+              <span>将文件拖到此处，或点击上传</span>
+              <small>支持 .docx / .pdf / .txt · 最大 15MB · 完成后导出 Word</small>
               <input id="fileInput" type="file" accept=".txt,.docx,.pdf" />
             </div>
             <div class="report-upload-panel" id="reportUploadPanel" hidden>
@@ -507,8 +508,9 @@
         </form>
       </section>
     </div>
-    <script src="/vendor/supabase.js?v=20260619-pages-prod"></script>
-    <script type="module" src="/supabase-auth.js?v=20260619-pages-prod"></script>
-    <script src="./app.js?v=20260619-pages-prod"></script>
+    <script src="/vendor/supabase.js?v=20260624-step-text-1"></script>
+    <script type="module" src="/supabase-auth.js?v=20260624-step-text-1"></script>
+    <script src="./app.js?v=20260624-step-text-1"></script>
   </body>
 </html>
+
