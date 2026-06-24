@@ -39,7 +39,7 @@ from pathlib import Path
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "2026-06-24-bypass-retry-1"
+APP_VERSION = "2026-06-25-docx-format-preserve-1"
 
 
 def load_dotenv() -> None:
@@ -1863,6 +1863,89 @@ def red_replacement_run(text: str, template_rpr=None):
     return run
 
 
+RUN_TEXT_TAGS = {w_tag("t"), w_tag("tab"), w_tag("br"), w_tag("cr")}
+
+
+def run_visible_text(run) -> str:
+    chunks: list[str] = []
+    for node in run:
+        if node.tag == w_tag("t"):
+            chunks.append(node.text or "")
+        elif node.tag == w_tag("tab"):
+            chunks.append("\t")
+        elif node.tag in {w_tag("br"), w_tag("cr")}:
+            chunks.append("\n")
+    return "".join(chunks)
+
+
+def clear_run_visible_text(run) -> None:
+    for node in list(run):
+        if node.tag in RUN_TEXT_TAGS:
+            run.remove(node)
+
+
+def append_text_to_run(run, text: str) -> None:
+    for idx, piece in enumerate(str(text or "").split("\n")):
+        if idx:
+            run.append(ET.Element(w_tag("br")))
+        if piece or idx == 0:
+            text_node = ET.Element(w_tag("t"))
+            text_node.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            text_node.text = piece
+            run.append(text_node)
+
+
+def mark_run_red(run) -> None:
+    rpr = run.find(w_tag("rPr"))
+    if rpr is None:
+        rpr = ET.Element(w_tag("rPr"))
+        run.insert(0, rpr)
+    apply_red_to_rpr(rpr)
+
+
+def split_replacement_across_runs(text: str, lengths: list[int]) -> list[str]:
+    if not lengths:
+        return [text]
+    if len(lengths) == 1:
+        return [text]
+    value = str(text or "")
+    total = sum(max(1, length) for length in lengths)
+    chunks: list[str] = []
+    cursor = 0
+    accumulated = 0
+    for idx, length in enumerate(lengths):
+        if idx == len(lengths) - 1:
+            chunks.append(value[cursor:])
+            break
+        accumulated += max(1, length)
+        end = round(len(value) * accumulated / total)
+        if end <= cursor and cursor < len(value):
+            end = cursor + 1
+        chunks.append(value[cursor:end])
+        cursor = end
+    return chunks
+
+
+def replace_paragraph_text_preserving_runs(para, text: str) -> None:
+    text_runs = []
+    for run in para.findall(f".//{{{W_NS}}}r"):
+        visible = run_visible_text(run)
+        if visible:
+            text_runs.append({"run": run, "length": len(visible)})
+    if not text_runs:
+        para.append(red_replacement_run(text))
+        return
+    chunks = split_replacement_across_runs(text, [item["length"] for item in text_runs])
+    for item in text_runs:
+        clear_run_visible_text(item["run"])
+    for item, chunk in zip(text_runs, chunks):
+        if not chunk:
+            continue
+        run = item["run"]
+        mark_run_red(run)
+        append_text_to_run(run, chunk)
+
+
 def replace_docx_paragraph_text(data: bytes, replacements: dict[int, str]) -> bytes:
     if not replacements:
         return data
@@ -1876,14 +1959,7 @@ def replace_docx_paragraph_text(data: bytes, replacements: dict[int, str]) -> by
             paragraph, _marked = paragraph_text_and_marked(para)
             if paragraph:
                 if text_index in replacements:
-                    first_run = para.find(w_tag("r"))
-                    template_rpr = first_run.find(w_tag("rPr")) if first_run is not None else None
-                    preserved = [child for child in list(para) if child.tag == w_tag("pPr")]
-                    for child in list(para):
-                        para.remove(child)
-                    for child in preserved:
-                        para.append(child)
-                    para.append(red_replacement_run(replacements[text_index], template_rpr))
+                    replace_paragraph_text_preserving_runs(para, replacements[text_index])
                 text_index += 1
         new_document = ET.tostring(root, encoding="utf-8", xml_declaration=True)
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as target:
